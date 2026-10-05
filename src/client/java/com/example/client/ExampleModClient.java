@@ -6,8 +6,14 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntitySpawnReason;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.Vec3;
 
 import java.io.BufferedInputStream;
@@ -18,14 +24,32 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 
 public class ExampleModClient implements ClientModInitializer {
-	// Har tick ka data: x, y, z, yaw, pitch
-	private static List<double[]> frames = new ArrayList<>();
+	private static final int MAGIC = 0x52570002; // file format v2
+
+	private record EntityFrame(int id, String type, double x, double y, double z,
+							   float yRot, float xRot, float head) {}
+
+	private record Frame(double x, double y, double z, float yRot, float xRot,
+						 List<EntityFrame> ents) {}
+
+	private static List<Frame> frames = new ArrayList<>();
 	private static boolean recording = false;
 	private static boolean playing = false;
 	private static int playIndex = 0;
+
+	// Replay ke nakli entities: recorded id -> ghost entity
+	private static final Map<Integer, Entity> ghosts = new HashMap<>();
+	// Jin types ka ghost ban nahi paya, unhe dobara try nahi karenge
+	private static final Set<String> badTypes = new HashSet<>();
 
 	@Override
 	public void onInitializeClient() {
@@ -33,31 +57,119 @@ public class ExampleModClient implements ClientModInitializer {
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
 			LocalPlayer p = client.player;
-			if (p == null) return;
+			ClientLevel level = client.level;
+
+			if (p == null || level == null) {
+				// World chhod diya
+				recording = false;
+				playing = false;
+				ghosts.clear();
+				return;
+			}
 
 			if (recording) {
-				frames.add(new double[]{p.getX(), p.getY(), p.getZ(), p.getYRot(), p.getXRot()});
+				List<EntityFrame> list = new ArrayList<>();
+				for (Entity e : level.entitiesForRendering()) {
+					if (e instanceof Player) continue;
+					if (e.distanceToSqr(p) > 48.0 * 48.0) continue;
+					list.add(new EntityFrame(
+						e.getId(),
+						EntityType.getKey(e.getType()).toString(),
+						e.getX(), e.getY(), e.getZ(),
+						e.getYRot(), e.getXRot(), e.getYHeadRot()));
+				}
+				frames.add(new Frame(p.getX(), p.getY(), p.getZ(), p.getYRot(), p.getXRot(), list));
 			}
 
 			if (playing) {
 				if (playIndex >= frames.size()) {
 					playing = false;
+					clearGhosts();
 					say(p, "Replay khatam.");
 					return;
 				}
-				double[] f = frames.get(playIndex++);
-				p.setPos(f[0], f[1], f[2]);
-				p.setYRot((float) f[3]);
-				p.setXRot((float) f[4]);
+				Frame f = frames.get(playIndex++);
+				p.setPos(f.x(), f.y(), f.z());
+				p.setYRot(f.yRot());
+				p.setXRot(f.xRot());
 				p.setDeltaMovement(Vec3.ZERO);
+				updateGhosts(level, f);
 			}
 		});
+	}
+
+	private static void updateGhosts(ClientLevel level, Frame f) {
+		Set<Integer> present = new HashSet<>();
+
+		for (EntityFrame ef : f.ents()) {
+			present.add(ef.id());
+			Entity g = ghosts.get(ef.id());
+			if (g == null) {
+				g = spawnGhost(level, ef);
+				if (g == null) continue;
+				ghosts.put(ef.id(), g);
+			}
+			place(g, ef);
+		}
+
+		// Jo entities is tick mein nahi hain unhe hata do
+		Iterator<Map.Entry<Integer, Entity>> it = ghosts.entrySet().iterator();
+		while (it.hasNext()) {
+			Map.Entry<Integer, Entity> en = it.next();
+			if (!present.contains(en.getKey())) {
+				en.getValue().discard();
+				it.remove();
+			}
+		}
+	}
+
+	private static Entity spawnGhost(ClientLevel level, EntityFrame ef) {
+		if (badTypes.contains(ef.type())) return null;
+		try {
+			Optional<EntityType<?>> type = EntityType.byString(ef.type());
+			if (type.isEmpty()) {
+				badTypes.add(ef.type());
+				return null;
+			}
+			Entity g = type.get().create(level, EntitySpawnReason.COMMAND);
+			if (g == null) {
+				badTypes.add(ef.type());
+				return null;
+			}
+			g.setNoGravity(true);
+			g.setSilent(true);
+			place(g, ef);
+			level.addEntity(g);
+			return g;
+		} catch (Exception ex) {
+			badTypes.add(ef.type());
+			return null;
+		}
+	}
+
+	private static void place(Entity g, EntityFrame ef) {
+		g.setPos(ef.x(), ef.y(), ef.z());
+		g.setYRot(ef.yRot());
+		g.setXRot(ef.xRot());
+		g.setYHeadRot(ef.head());
+		if (g instanceof LivingEntity le) {
+			le.setYBodyRot(ef.yRot());
+		}
+		g.setDeltaMovement(Vec3.ZERO);
+	}
+
+	private static void clearGhosts() {
+		for (Entity g : ghosts.values()) {
+			g.discard();
+		}
+		ghosts.clear();
 	}
 
 	private void registerCommands() {
 		ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
 			dispatcher.register(ClientCommandManager.literal("rw")
 				.then(ClientCommandManager.literal("start").executes(ctx -> {
+					clearGhosts();
 					frames = new ArrayList<>();
 					playing = false;
 					recording = true;
@@ -67,6 +179,7 @@ public class ExampleModClient implements ClientModInitializer {
 				.then(ClientCommandManager.literal("cancel").executes(ctx -> {
 					recording = false;
 					playing = false;
+					clearGhosts();
 					ctx.getSource().sendFeedback(Component.literal("Roka gaya."));
 					return 1;
 				}))
@@ -89,6 +202,7 @@ public class ExampleModClient implements ClientModInitializer {
 						try {
 							load(name);
 							recording = false;
+							clearGhosts();
 							playIndex = 0;
 							playing = true;
 							ctx.getSource().sendFeedback(Component.literal("Replay chal raha hai: " + name));
@@ -114,9 +228,25 @@ public class ExampleModClient implements ClientModInitializer {
 	private static void save(String name) throws IOException {
 		try (DataOutputStream out = new DataOutputStream(
 				new BufferedOutputStream(Files.newOutputStream(dir().resolve(name + ".rw"))))) {
+			out.writeInt(MAGIC);
 			out.writeInt(frames.size());
-			for (double[] f : frames) {
-				for (double v : f) out.writeDouble(v);
+			for (Frame f : frames) {
+				out.writeDouble(f.x());
+				out.writeDouble(f.y());
+				out.writeDouble(f.z());
+				out.writeFloat(f.yRot());
+				out.writeFloat(f.xRot());
+				out.writeInt(f.ents().size());
+				for (EntityFrame e : f.ents()) {
+					out.writeInt(e.id());
+					out.writeUTF(e.type());
+					out.writeDouble(e.x());
+					out.writeDouble(e.y());
+					out.writeDouble(e.z());
+					out.writeFloat(e.yRot());
+					out.writeFloat(e.xRot());
+					out.writeFloat(e.head());
+				}
 			}
 		}
 	}
@@ -124,14 +254,33 @@ public class ExampleModClient implements ClientModInitializer {
 	private static void load(String name) throws IOException {
 		try (DataInputStream in = new DataInputStream(
 				new BufferedInputStream(Files.newInputStream(dir().resolve(name + ".rw"))))) {
+			if (in.readInt() != MAGIC) {
+				throw new IOException("Ye purani file hai, nayi record karo");
+			}
 			int n = in.readInt();
-			List<double[]> loaded = new ArrayList<>();
+			List<Frame> loaded = new ArrayList<>();
 			for (int i = 0; i < n; i++) {
-				double[] f = new double[5];
-				for (int j = 0; j < 5; j++) f[j] = in.readDouble();
-				loaded.add(f);
+				double x = in.readDouble();
+				double y = in.readDouble();
+				double z = in.readDouble();
+				float yRot = in.readFloat();
+				float xRot = in.readFloat();
+				int count = in.readInt();
+				List<EntityFrame> ents = new ArrayList<>();
+				for (int k = 0; k < count; k++) {
+					int id = in.readInt();
+					String type = in.readUTF();
+					double ex = in.readDouble();
+					double ey = in.readDouble();
+					double ez = in.readDouble();
+					float eyRot = in.readFloat();
+					float exRot = in.readFloat();
+					float head = in.readFloat();
+					ents.add(new EntityFrame(id, type, ex, ey, ez, eyRot, exRot, head));
+				}
+				loaded.add(new Frame(x, y, z, yRot, xRot, ents));
 			}
 			frames = loaded;
 		}
 	}
-					}
+							 }
