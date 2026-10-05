@@ -19,6 +19,7 @@ import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.Vec3;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
@@ -53,7 +54,6 @@ public class ExampleModClient implements ClientModInitializer {
 	private static int playIndex = 0;
 
 	private static final Map<Integer, Entity> ghosts = new HashMap<>();
-	private static final Map<Integer, Integer> lastHurt = new HashMap<>();
 	private static final Set<String> badTypes = new HashSet<>();
 
 	@Override
@@ -68,7 +68,6 @@ public class ExampleModClient implements ClientModInitializer {
 				recording = false;
 				playing = false;
 				ghosts.clear();
-				lastHurt.clear();
 				return;
 			}
 
@@ -135,17 +134,8 @@ public class ExampleModClient implements ClientModInitializer {
 				ghosts.put(ef.id(), g);
 			}
 			place(g, ef);
-			if (g instanceof LivingEntity le) {
-				if (ef.swing()) {
-					le.swing(InteractionHand.MAIN_HAND);
-				}
-				// hurt: rising edge par vanilla "hurt" event (2) chalao.
-				// Isse hurt sound, leg flail aur lal flash teeno aate hain.
-				int prev = lastHurt.getOrDefault(ef.id(), 0);
-				if (ef.hurt() > 0 && ef.hurt() > prev) {
-					le.handleEntityEvent((byte) 2);
-				}
-				lastHurt.put(ef.id(), ef.hurt());
+			if (ef.swing() && g instanceof LivingEntity le) {
+				le.swing(InteractionHand.MAIN_HAND);
 			}
 		}
 
@@ -154,7 +144,6 @@ public class ExampleModClient implements ClientModInitializer {
 			Map.Entry<Integer, Entity> en = it.next();
 			if (!present.contains(en.getKey())) {
 				en.getValue().discard();
-				lastHurt.remove(en.getKey());
 				it.remove();
 			}
 		}
@@ -195,6 +184,7 @@ public class ExampleModClient implements ClientModInitializer {
 
 		if (g instanceof LivingEntity le) {
 			le.setYBodyRot(ef.yRot());
+			le.hurtTime = ef.hurt();
 
 			Item item = BuiltInRegistries.ITEM.byId(ef.item());
 			if (item != null && !le.getMainHandItem().is(item)) {
@@ -208,7 +198,6 @@ public class ExampleModClient implements ClientModInitializer {
 			g.discard();
 		}
 		ghosts.clear();
-		lastHurt.clear();
 	}
 
 	private void registerCommands() {
@@ -346,4 +335,4 @@ public class ExampleModClient implements ClientModInitializer {
 			frames = loaded;
 		}
 	}
-				}
+}
