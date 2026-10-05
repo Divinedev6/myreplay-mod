@@ -6,19 +6,19 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.loader.api.FabricLoader;
-import net.minecraft.class_1268;
-import net.minecraft.class_1297;
-import net.minecraft.class_1299;
-import net.minecraft.class_1309;
-import net.minecraft.class_1657;
-import net.minecraft.class_1792;
-import net.minecraft.class_1799;
-import net.minecraft.class_243;
-import net.minecraft.class_2561;
-import net.minecraft.class_3730;
-import net.minecraft.class_638;
-import net.minecraft.class_746;
-import net.minecraft.class_7923;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntitySpawnReason;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.phys.Vec3;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
@@ -52,7 +52,7 @@ public class ExampleModClient implements ClientModInitializer {
 	private static boolean playing = false;
 	private static int playIndex = 0;
 
-	private static final Map<Integer, class_1297> ghosts = new HashMap<>();
+	private static final Map<Integer, Entity> ghosts = new HashMap<>();
 	private static final Map<Integer, Integer> lastHurt = new HashMap<>();
 	private static final Set<String> badTypes = new HashSet<>();
 
@@ -61,8 +61,8 @@ public class ExampleModClient implements ClientModInitializer {
 		registerCommands();
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
-			class_746 p = client.field_1724;
-			class_638 level = client.field_1687;
+			LocalPlayer p = client.player;
+			ClientLevel level = client.level;
 
 			if (p == null || level == null) {
 				recording = false;
@@ -74,31 +74,31 @@ public class ExampleModClient implements ClientModInitializer {
 
 			if (recording) {
 				List<EntityFrame> list = new ArrayList<>();
-				for (class_1297 e : level.method_18112()) {
-					if (e instanceof class_1657) continue;
-					if (e.method_5858(p) > 48.0 * 48.0) continue;
+				for (Entity e : level.entitiesForRendering()) {
+					if (e instanceof Player) continue;
+					if (e.distanceToSqr(p) > 48.0 * 48.0) continue;
 
 					boolean swing = false;
 					int hurt = 0;
 					int item = 0;
-					if (e instanceof class_1309 le) {
-						swing = le.field_6252 && le.field_6279 == 0;
-						hurt = le.field_6235;
-						item = class_7923.field_41178.method_10206(le.method_6047().method_7909());
+					if (e instanceof LivingEntity le) {
+						swing = le.swinging && le.swingTime == 0;
+						hurt = le.hurtTime;
+						item = BuiltInRegistries.ITEM.getId(le.getMainHandItem().getItem());
 					}
 
 					list.add(new EntityFrame(
-						e.method_5628(),
-						class_1299.method_5890(e.method_5864()).toString(),
-						e.method_23317(), e.method_23318(), e.method_23321(),
-						e.method_36454(), e.method_36455(), e.method_5791(),
+						e.getId(),
+						EntityType.getKey(e.getType()).toString(),
+						e.getX(), e.getY(), e.getZ(),
+						e.getYRot(), e.getXRot(), e.getYHeadRot(),
 						swing, hurt, item,
-						e.method_5715(), e.method_5624()));
+						e.isShiftKeyDown(), e.isSprinting()));
 				}
-				boolean pSwing = p.field_6252 && p.field_6279 == 0;
+				boolean pSwing = p.swinging && p.swingTime == 0;
 				frames.add(new Frame(
-					p.method_23317(), p.method_23318(), p.method_23321(), p.method_36454(), p.method_36455(),
-					pSwing, p.method_5715(), p.method_5624(), list));
+					p.getX(), p.getY(), p.getZ(), p.getYRot(), p.getXRot(),
+					pSwing, p.isShiftKeyDown(), p.isSprinting(), list));
 			}
 
 			if (playing) {
@@ -109,74 +109,74 @@ public class ExampleModClient implements ClientModInitializer {
 					return;
 				}
 				Frame f = frames.get(playIndex++);
-				p.method_5814(f.x(), f.y(), f.z());
-				p.method_36456(f.yRot());
-				p.method_36457(f.xRot());
-				p.method_18799(class_243.field_1353);
-				p.method_5660(f.sneak());
-				p.method_5728(f.sprint());
+				p.setPos(f.x(), f.y(), f.z());
+				p.setYRot(f.yRot());
+				p.setXRot(f.xRot());
+				p.setDeltaMovement(Vec3.ZERO);
+				p.setShiftKeyDown(f.sneak());
+				p.setSprinting(f.sprint());
 				if (f.swing()) {
-					p.method_6104(class_1268.field_5808);
+					p.swing(InteractionHand.MAIN_HAND);
 				}
 				updateGhosts(level, f);
 			}
 		});
 	}
 
-	private static void updateGhosts(class_638 level, Frame f) {
+	private static void updateGhosts(ClientLevel level, Frame f) {
 		Set<Integer> present = new HashSet<>();
 
 		for (EntityFrame ef : f.ents()) {
 			present.add(ef.id());
-			class_1297 g = ghosts.get(ef.id());
+			Entity g = ghosts.get(ef.id());
 			if (g == null) {
 				g = spawnGhost(level, ef);
 				if (g == null) continue;
 				ghosts.put(ef.id(), g);
 			}
 			place(g, ef);
-			if (g instanceof class_1309 le) {
+			if (g instanceof LivingEntity le) {
 				if (ef.swing()) {
-					le.method_6104(class_1268.field_5808);
+					le.swing(InteractionHand.MAIN_HAND);
 				}
 				// hurt: rising edge par vanilla "hurt" event (2) chalao.
 				// Isse hurt sound, leg flail aur lal flash teeno aate hain.
 				int prev = lastHurt.getOrDefault(ef.id(), 0);
 				if (ef.hurt() > 0 && ef.hurt() > prev) {
-					le.method_5711((byte) 2);
+					le.handleEntityEvent((byte) 2);
 				}
 				lastHurt.put(ef.id(), ef.hurt());
 			}
 		}
 
-		Iterator<Map.Entry<Integer, class_1297>> it = ghosts.entrySet().iterator();
+		Iterator<Map.Entry<Integer, Entity>> it = ghosts.entrySet().iterator();
 		while (it.hasNext()) {
-			Map.Entry<Integer, class_1297> en = it.next();
+			Map.Entry<Integer, Entity> en = it.next();
 			if (!present.contains(en.getKey())) {
-				en.getValue().method_31472();
+				en.getValue().discard();
 				lastHurt.remove(en.getKey());
 				it.remove();
 			}
 		}
 	}
 
-	private static class_1297 spawnGhost(class_638 level, EntityFrame ef) {
+	private static Entity spawnGhost(ClientLevel level, EntityFrame ef) {
 		if (badTypes.contains(ef.type())) return null;
 		try {
-			Optional<class_1299<?>> type = class_1299.method_5898(ef.type());
+			Optional<EntityType<?>> type = EntityType.byString(ef.type());
 			if (type.isEmpty()) {
 				badTypes.add(ef.type());
 				return null;
 			}
-			class_1297 g = type.get().method_5883(level, class_3730.field_16462);
+			Entity g = type.get().create(level, EntitySpawnReason.COMMAND);
 			if (g == null) {
 				badTypes.add(ef.type());
 				return null;
 			}
-			g.method_5875(true);
-			g.method_5803(true);
+			g.setNoGravity(true);
+			g.setSilent(true);
 			place(g, ef);
-			level.method_53875(g);
+			level.addEntity(g);
 			return g;
 		} catch (Exception ex) {
 			badTypes.add(ef.type());
@@ -184,28 +184,28 @@ public class ExampleModClient implements ClientModInitializer {
 		}
 	}
 
-	private static void place(class_1297 g, EntityFrame ef) {
-		g.method_5814(ef.x(), ef.y(), ef.z());
-		g.method_36456(ef.yRot());
-		g.method_36457(ef.xRot());
-		g.method_5847(ef.head());
-		g.method_18799(class_243.field_1353);
-		g.method_5660(ef.sneak());
-		g.method_5728(ef.sprint());
+	private static void place(Entity g, EntityFrame ef) {
+		g.setPos(ef.x(), ef.y(), ef.z());
+		g.setYRot(ef.yRot());
+		g.setXRot(ef.xRot());
+		g.setYHeadRot(ef.head());
+		g.setDeltaMovement(Vec3.ZERO);
+		g.setShiftKeyDown(ef.sneak());
+		g.setSprinting(ef.sprint());
 
-		if (g instanceof class_1309 le) {
-			le.method_5636(ef.yRot());
+		if (g instanceof LivingEntity le) {
+			le.setYBodyRot(ef.yRot());
 
-			class_1792 item = class_7923.field_41178.method_10200(ef.item());
-			if (item != null && !le.method_6047().method_31574(item)) {
-				le.method_6122(class_1268.field_5808, new class_1799(item));
+			Item item = BuiltInRegistries.ITEM.byId(ef.item());
+			if (item != null && !le.getMainHandItem().is(item)) {
+				le.setItemInHand(InteractionHand.MAIN_HAND, new ItemStack(item));
 			}
 		}
 	}
 
 	private static void clearGhosts() {
-		for (class_1297 g : ghosts.values()) {
-			g.method_31472();
+		for (Entity g : ghosts.values()) {
+			g.discard();
 		}
 		ghosts.clear();
 		lastHurt.clear();
@@ -219,14 +219,14 @@ public class ExampleModClient implements ClientModInitializer {
 					frames = new ArrayList<>();
 					playing = false;
 					recording = true;
-					ctx.getSource().sendFeedback(class_2561.method_43470("Recording shuru!"));
+					ctx.getSource().sendFeedback(Component.literal("Recording shuru!"));
 					return 1;
 				}))
 				.then(ClientCommandManager.literal("cancel").executes(ctx -> {
 					recording = false;
 					playing = false;
 					clearGhosts();
-					ctx.getSource().sendFeedback(class_2561.method_43470("Roka gaya."));
+					ctx.getSource().sendFeedback(Component.literal("Roka gaya."));
 					return 1;
 				}))
 				.then(ClientCommandManager.literal("stop")
@@ -235,10 +235,10 @@ public class ExampleModClient implements ClientModInitializer {
 						recording = false;
 						try {
 							save(name);
-							ctx.getSource().sendFeedback(class_2561.method_43470(
+							ctx.getSource().sendFeedback(Component.literal(
 								"Save ho gaya: " + name + " (" + frames.size() + " ticks)"));
 						} catch (IOException e) {
-							ctx.getSource().sendFeedback(class_2561.method_43470("Save error: " + e.getMessage()));
+							ctx.getSource().sendFeedback(Component.literal("Save error: " + e.getMessage()));
 						}
 						return 1;
 					})))
@@ -251,9 +251,9 @@ public class ExampleModClient implements ClientModInitializer {
 							clearGhosts();
 							playIndex = 0;
 							playing = true;
-							ctx.getSource().sendFeedback(class_2561.method_43470("Replay chal raha hai: " + name));
+							ctx.getSource().sendFeedback(Component.literal("Replay chal raha hai: " + name));
 						} catch (IOException e) {
-							ctx.getSource().sendFeedback(class_2561.method_43470("Load error: " + e.getMessage()));
+							ctx.getSource().sendFeedback(Component.literal("Load error: " + e.getMessage()));
 						}
 						return 1;
 					})))
@@ -261,8 +261,8 @@ public class ExampleModClient implements ClientModInitializer {
 		);
 	}
 
-	private static void say(class_746 p, String msg) {
-		p.method_7353(class_2561.method_43470(msg), false);
+	private static void say(LocalPlayer p, String msg) {
+		p.displayClientMessage(Component.literal(msg), false);
 	}
 
 	private static Path dir() throws IOException {
@@ -346,4 +346,4 @@ public class ExampleModClient implements ClientModInitializer {
 			frames = loaded;
 		}
 	}
-							  }
+				}
