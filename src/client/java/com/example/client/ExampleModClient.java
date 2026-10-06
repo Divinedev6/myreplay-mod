@@ -20,7 +20,9 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntitySpawnReason;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Pose;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -44,13 +46,18 @@ import java.util.Optional;
 import java.util.Set;
 
 public class ExampleModClient implements ClientModInitializer {
-	private static final int MAGIC = 0x52570005; // file format v5
+	private static final int MAGIC = 0x52570006; // file format v6
+
+	// All equipment slots (head, chest, legs, feet, offhand, body armor, saddle...)
+	private static final EquipmentSlot[] SLOTS = EquipmentSlot.values();
 
 	// data = entity's synced data (colour, variant, baby, etc.), only present every 20 ticks
+	// equip = item id for each equipment slot, in the order of SLOTS
 	private record EntityFrame(int id, String type, double x, double y, double z,
 							   float yRot, float xRot, float head,
 							   boolean swing, int hurt, int item,
 							   boolean sneak, boolean sprint,
+							   int[] equip,
 							   byte[] data) {}
 
 	private record Frame(double x, double y, double z, float yRot, float xRot,
@@ -146,6 +153,10 @@ public class ExampleModClient implements ClientModInitializer {
 				p.setDeltaMovement(Vec3.ZERO);
 				p.fallDistance = 0;
 				p.setShiftKeyDown(f.sneak());
+				if (f.sneak()) {
+					// Crouch pose lowers the camera in first person
+					p.setPose(Pose.CROUCHING);
+				}
 				p.setSprinting(f.sprint());
 				if (f.swing()) {
 					p.swing(InteractionHand.MAIN_HAND);
@@ -186,10 +197,14 @@ public class ExampleModClient implements ClientModInitializer {
 			boolean swing = false;
 			int hurt = 0;
 			int item = 0;
+			int[] equip = new int[SLOTS.length];
 			if (e instanceof LivingEntity le) {
 				swing = le.swinging && le.swingTime == 0;
 				hurt = le.hurtTime;
 				item = BuiltInRegistries.ITEM.getId(le.getMainHandItem().getItem());
+				for (int i = 0; i < SLOTS.length; i++) {
+					equip[i] = BuiltInRegistries.ITEM.getId(le.getItemBySlot(SLOTS[i]).getItem());
+				}
 			}
 
 			byte[] data = withData ? packData(e, level) : new byte[0];
@@ -201,6 +216,7 @@ public class ExampleModClient implements ClientModInitializer {
 				e.getYRot(), e.getXRot(), e.getYHeadRot(),
 				swing, hurt, item,
 				e.isShiftKeyDown(), e.isSprinting(),
+				equip,
 				data));
 		}
 
@@ -353,6 +369,19 @@ public class ExampleModClient implements ClientModInitializer {
 			if (item != null && !le.getMainHandItem().is(item)) {
 				le.setItemInHand(InteractionHand.MAIN_HAND, new ItemStack(item));
 			}
+
+			// Armor, offhand, saddle, horse armor, etc.
+			for (int i = 0; i < SLOTS.length && i < ef.equip().length; i++) {
+				if (SLOTS[i] == EquipmentSlot.MAINHAND) continue;
+				Item eq = BuiltInRegistries.ITEM.byId(ef.equip()[i]);
+				if (eq != null && !le.getItemBySlot(SLOTS[i]).is(eq)) {
+					try {
+						le.setItemSlot(SLOTS[i], new ItemStack(eq));
+					} catch (Exception ex) {
+						// this entity can't wear that, ignore
+					}
+				}
+			}
 		}
 	}
 
@@ -493,6 +522,10 @@ public class ExampleModClient implements ClientModInitializer {
 					out.writeInt(e.item());
 					out.writeBoolean(e.sneak());
 					out.writeBoolean(e.sprint());
+					out.writeInt(e.equip().length);
+					for (int v : e.equip()) {
+						out.writeInt(v);
+					}
 					out.writeInt(e.data().length);
 					out.write(e.data());
 				}
@@ -535,6 +568,14 @@ public class ExampleModClient implements ClientModInitializer {
 					int eItem = in.readInt();
 					boolean eSneak = in.readBoolean();
 					boolean eSprint = in.readBoolean();
+					int eqLen = in.readInt();
+					if (eqLen < 0 || eqLen > 32) {
+						throw new IOException("Corrupt replay file");
+					}
+					int[] equip = new int[eqLen];
+					for (int j = 0; j < eqLen; j++) {
+						equip[j] = in.readInt();
+					}
 					int len = in.readInt();
 					if (len < 0 || len > 100000) {
 						throw new IOException("Corrupt replay file");
@@ -542,11 +583,11 @@ public class ExampleModClient implements ClientModInitializer {
 					byte[] data = new byte[len];
 					in.readFully(data);
 					ents.add(new EntityFrame(id, type, ex, ey, ez, eyRot, exRot, head,
-						eSwing, eHurt, eItem, eSneak, eSprint, data));
+						eSwing, eHurt, eItem, eSneak, eSprint, equip, data));
 				}
 				loaded.add(new Frame(x, y, z, yRot, xRot, swing, sneak, sprint, hurt, item, ents));
 			}
 			frames = loaded;
 		}
 	}
-												  }
+						   }
