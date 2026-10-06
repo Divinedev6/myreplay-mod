@@ -2,6 +2,7 @@ package com.example.client;
 
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import io.netty.buffer.Unpooled;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -10,7 +11,10 @@ import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
+import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntitySpawnReason;
@@ -39,12 +43,14 @@ import java.util.Optional;
 import java.util.Set;
 
 public class ExampleModClient implements ClientModInitializer {
-	private static final int MAGIC = 0x52570004; // file format v4
+	private static final int MAGIC = 0x52570005; // file format v5
 
+	// data = entity's synced data (colour, variant, baby, etc.), only present every 20 ticks
 	private record EntityFrame(int id, String type, double x, double y, double z,
 							   float yRot, float xRot, float head,
 							   boolean swing, int hurt, int item,
-							   boolean sneak, boolean sprint) {}
+							   boolean sneak, boolean sprint,
+							   byte[] data) {}
 
 	private record Frame(double x, double y, double z, float yRot, float xRot,
 						 boolean swing, boolean sneak, boolean sprint,
@@ -55,6 +61,7 @@ public class ExampleModClient implements ClientModInitializer {
 	private static boolean recording = false;
 	private static boolean playing = false;
 	private static int playIndex = 0;
+	private static long captureTick = 0;
 
 	// Shadow Rewind
 	private static final ArrayDeque<Frame> shadow = new ArrayDeque<>();
@@ -118,6 +125,7 @@ public class ExampleModClient implements ClientModInitializer {
 					say(p, "Replay finished.");
 					return;
 				}
+				int idx = playIndex;
 				Frame f = frames.get(playIndex++);
 				p.setPos(f.x(), f.y(), f.z());
 				p.setYRot(f.yRot());
@@ -141,12 +149,15 @@ public class ExampleModClient implements ClientModInitializer {
 					p.setItemInHand(InteractionHand.MAIN_HAND, new ItemStack(item));
 				}
 
-				updateGhosts(level, f);
+				updateGhosts(level, f, idx);
 			}
 		});
 	}
 
 	private static Frame capture(LocalPlayer p, ClientLevel level) {
+		captureTick++;
+		boolean withData = (captureTick % 20 == 0);
+
 		List<EntityFrame> list = new ArrayList<>();
 		for (Entity e : level.entitiesForRendering()) {
 			if (e instanceof Player) continue;
@@ -161,13 +172,16 @@ public class ExampleModClient implements ClientModInitializer {
 				item = BuiltInRegistries.ITEM.getId(le.getMainHandItem().getItem());
 			}
 
+			byte[] data = withData ? packData(e, level) : new byte[0];
+
 			list.add(new EntityFrame(
 				e.getId(),
 				EntityType.getKey(e.getType()).toString(),
 				e.getX(), e.getY(), e.getZ(),
 				e.getYRot(), e.getXRot(), e.getYHeadRot(),
 				swing, hurt, item,
-				e.isShiftKeyDown(), e.isSprinting()));
+				e.isShiftKeyDown(), e.isSprinting(),
+				data));
 		}
 
 		boolean pSwing = p.swinging && p.swingTime == 0;
@@ -178,6 +192,48 @@ public class ExampleModClient implements ClientModInitializer {
 			p.hurtTime, pItem, list);
 	}
 
+	// Turn the entity's synced data into bytes
+	private static byte[] packData(Entity e, ClientLevel level) {
+		try {
+			List<SynchedEntityData.DataValue<?>> values = e.getEntityData().getNonDefaultValues();
+			if (values == null || values.isEmpty()) return new byte[0];
+			RegistryFriendlyByteBuf buf = new RegistryFriendlyByteBuf(Unpooled.buffer(), level.registryAccess());
+			ClientboundSetEntityDataPacket.STREAM_CODEC.encode(buf, new ClientboundSetEntityDataPacket(e.getId(), values));
+			byte[] out = new byte[buf.readableBytes()];
+			buf.readBytes(out);
+			return out;
+		} catch (Exception ex) {
+			return new byte[0];
+		}
+	}
+
+	// Put saved synced data onto a ghost entity
+	private static void applyData(Entity g, byte[] data, ClientLevel level) {
+		if (data == null || data.length == 0) return;
+		try {
+			RegistryFriendlyByteBuf buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(data), level.registryAccess());
+			ClientboundSetEntityDataPacket pkt = ClientboundSetEntityDataPacket.STREAM_CODEC.decode(buf);
+			g.getEntityData().assignValues(pkt.packedItems());
+			g.setNoGravity(true);
+			g.setSilent(true);
+		} catch (Exception ex) {
+			// ignore, ghost just keeps default look
+		}
+	}
+
+	// Find the next saved data for this entity in the coming frames
+	private static byte[] lookAhead(int from, int id) {
+		int end = Math.min(frames.size(), from + 25);
+		for (int i = from; i < end; i++) {
+			for (EntityFrame ef : frames.get(i).ents()) {
+				if (ef.id() == id && ef.data().length > 0) {
+					return ef.data();
+				}
+			}
+		}
+		return new byte[0];
+	}
+
 	private static void restoreHand(LocalPlayer p) {
 		if (handSaved) {
 			p.setItemInHand(InteractionHand.MAIN_HAND, savedHand);
@@ -186,7 +242,7 @@ public class ExampleModClient implements ClientModInitializer {
 		}
 	}
 
-	private static void updateGhosts(ClientLevel level, Frame f) {
+	private static void updateGhosts(ClientLevel level, Frame f, int idx) {
 		Set<Integer> present = new HashSet<>();
 
 		for (EntityFrame ef : f.ents()) {
@@ -196,6 +252,10 @@ public class ExampleModClient implements ClientModInitializer {
 				g = spawnGhost(level, ef);
 				if (g == null) continue;
 				ghosts.put(ef.id(), g);
+				byte[] data = ef.data().length > 0 ? ef.data() : lookAhead(idx, ef.id());
+				applyData(g, data, level);
+			} else if (ef.data().length > 0) {
+				applyData(g, ef.data(), level);
 			}
 			place(g, ef);
 			if (ef.swing() && g instanceof LivingEntity le) {
@@ -394,6 +454,8 @@ public class ExampleModClient implements ClientModInitializer {
 					out.writeInt(e.item());
 					out.writeBoolean(e.sneak());
 					out.writeBoolean(e.sprint());
+					out.writeInt(e.data().length);
+					out.write(e.data());
 				}
 			}
 		}
@@ -434,12 +496,18 @@ public class ExampleModClient implements ClientModInitializer {
 					int eItem = in.readInt();
 					boolean eSneak = in.readBoolean();
 					boolean eSprint = in.readBoolean();
+					int len = in.readInt();
+					if (len < 0 || len > 100000) {
+						throw new IOException("Corrupt replay file");
+					}
+					byte[] data = new byte[len];
+					in.readFully(data);
 					ents.add(new EntityFrame(id, type, ex, ey, ez, eyRot, exRot, head,
-						eSwing, eHurt, eItem, eSneak, eSprint));
+						eSwing, eHurt, eItem, eSneak, eSprint, data));
 				}
 				loaded.add(new Frame(x, y, z, yRot, xRot, swing, sneak, sprint, hurt, item, ents));
 			}
 			frames = loaded;
 		}
 	}
-		}
+	}
