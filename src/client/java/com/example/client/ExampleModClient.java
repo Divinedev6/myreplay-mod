@@ -8,6 +8,7 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -171,10 +172,16 @@ public class ExampleModClient implements ClientModInitializer {
 		captureTick++;
 		boolean withData = (captureTick % 20 == 0);
 
+		// Record everything inside the video-settings render distance (in chunks)
+		int rd = Minecraft.getInstance().options.renderDistance().get();
+		int pcx = p.getBlockX() >> 4;
+		int pcz = p.getBlockZ() >> 4;
+
 		List<EntityFrame> list = new ArrayList<>();
 		for (Entity e : level.entitiesForRendering()) {
 			if (e instanceof Player) continue;
-			if (e.distanceToSqr(p) > 48.0 * 48.0) continue;
+			if (Math.abs((e.getBlockX() >> 4) - pcx) > rd
+					|| Math.abs((e.getBlockZ() >> 4) - pcz) > rd) continue;
 
 			boolean swing = false;
 			int hurt = 0;
@@ -276,7 +283,7 @@ public class ExampleModClient implements ClientModInitializer {
 			} else if (ef.data().length > 0) {
 				applyData(g, ef.data(), level);
 			}
-			place(g, ef);
+			place(g, ef, true);
 			if (ef.swing() && g instanceof LivingEntity le) {
 				le.swing(InteractionHand.MAIN_HAND);
 			}
@@ -307,7 +314,7 @@ public class ExampleModClient implements ClientModInitializer {
 			}
 			g.setNoGravity(true);
 			g.setSilent(true);
-			place(g, ef);
+			place(g, ef, false);
 			level.addEntity(g);
 			return g;
 		} catch (Exception ex) {
@@ -316,8 +323,17 @@ public class ExampleModClient implements ClientModInitializer {
 		}
 	}
 
-	private static void place(Entity g, EntityFrame ef) {
+	// animate = true: also update the walk/run leg animation from the movement since last tick
+	private static void place(Entity g, EntityFrame ef, boolean animate) {
+		// Remember the old position so the game can see how far the entity moved
+		double px = g.getX();
+		double py = g.getY();
+		double pz = g.getZ();
+
 		g.setPos(ef.x(), ef.y(), ef.z());
+		g.xo = px;
+		g.yo = py;
+		g.zo = pz;
 		g.setYRot(ef.yRot());
 		g.setXRot(ef.xRot());
 		g.setYHeadRot(ef.head());
@@ -328,6 +344,10 @@ public class ExampleModClient implements ClientModInitializer {
 		if (g instanceof LivingEntity le) {
 			le.setYBodyRot(ef.yRot());
 			le.hurtTime = ef.hurt();
+
+			if (animate) {
+				le.calculateEntityAnimation(false);
+			}
 
 			Item item = BuiltInRegistries.ITEM.byId(ef.item());
 			if (item != null && !le.getMainHandItem().is(item)) {
@@ -529,4 +549,4 @@ public class ExampleModClient implements ClientModInitializer {
 			frames = loaded;
 		}
 	}
-					}
+												  }
