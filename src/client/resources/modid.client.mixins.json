@@ -2,8 +2,9 @@
 	"required": true,
 	"package": "com.example.client.mixin",
 	"compatibilityLevel": "JAVA_21",
-	"client": [
-		"ExampleClientMixin"
+		"client": [
+		"ExampleClientMixin",
+		"EntityHideMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1
