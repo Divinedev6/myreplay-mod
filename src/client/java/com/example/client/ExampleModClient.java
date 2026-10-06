@@ -1,5 +1,6 @@
 package com.example.client;
 
+import com.mojang.blaze3d.platform.InputConstants;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import io.netty.buffer.Unpooled;
@@ -7,7 +8,9 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
@@ -16,6 +19,7 @@ import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
 import net.minecraft.network.syncher.SynchedEntityData;
+import net.minecraft.resources.Identifier;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntitySpawnReason;
@@ -27,6 +31,7 @@ import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.Vec3;
+import org.lwjgl.glfw.GLFW;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -71,6 +76,9 @@ public class ExampleModClient implements ClientModInitializer {
 	private static int playIndex = 0;
 	private static long captureTick = 0;
 
+	// Key to start/stop recording (default: G)
+	private static KeyMapping toggleKey;
+
 	// Shadow Rewind
 	private static final ArrayDeque<Frame> shadow = new ArrayDeque<>();
 	private static boolean shadowOn = false;
@@ -100,9 +108,30 @@ public class ExampleModClient implements ClientModInitializer {
 		return !ghostEntityIds.contains(e.getId());
 	}
 
+	// Used by the name screen
+	public static void saveFrames(String name) throws IOException {
+		save(name, frames);
+	}
+
+	public static int frameCount() {
+		return frames.size();
+	}
+
+	public static void discardRecording() {
+		frames = new ArrayList<>();
+	}
+
 	@Override
 	public void onInitializeClient() {
 		registerCommands();
+
+		KeyMapping.Category category = KeyMapping.Category.register(
+			Identifier.fromNamespaceAndPath("modid", "empyrean"));
+		toggleKey = KeyBindingHelper.registerKeyBinding(new KeyMapping(
+			"key.modid.toggle_recording",
+			InputConstants.Type.KEYSYM,
+			GLFW.GLFW_KEY_G,
+			category));
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
 			LocalPlayer p = client.player;
@@ -123,6 +152,21 @@ public class ExampleModClient implements ClientModInitializer {
 			// Replay stopped: restore position and held item
 			if (!playing && handSaved) {
 				restorePlayerState(p);
+			}
+
+			// G key: start recording / stop recording and ask for a name
+			while (toggleKey.consumeClick()) {
+				if (playing) {
+					say(p, "Can't record during a replay.");
+				} else if (!recording) {
+					clearGhosts();
+					frames = new ArrayList<>();
+					recording = true;
+					say(p, "Recording started! Press G again to stop.");
+				} else {
+					recording = false;
+					client.setScreen(new RecNameScreen());
+				}
 			}
 
 			// Recording and Shadow Rewind (no capture during replay)
@@ -605,4 +649,4 @@ public class ExampleModClient implements ClientModInitializer {
 			frames = loaded;
 		}
 	}
-	}
+		}
