@@ -2,8 +2,8 @@
 	"schemaVersion": 1,
 	"id": "modid",
 	"version": "${version}",
-	"name": "Example Mod",
-	"description": "This is an example description! Tell everyone what your mod is about!",
+	"name": "Empyrean rec",
+	"description": "Record your Minecraft gameplay and replay it from your own POV and Shadow Rewind",
 	"authors": [
 		"Me!"
 	],
