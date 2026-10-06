@@ -46,7 +46,7 @@ import java.util.Optional;
 import java.util.Set;
 
 public class ExampleModClient implements ClientModInitializer {
-	private static final int MAGIC = 0x52570006; // file format v6
+	private static final int MAGIC = 0x52570006; // file format v6 (unchanged)
 
 	// All equipment slots (head, chest, legs, feet, offhand, body armor, saddle...)
 	private static final EquipmentSlot[] SLOTS = EquipmentSlot.values();
@@ -83,11 +83,21 @@ public class ExampleModClient implements ClientModInitializer {
 	private static float savedYaw, savedPitch;
 
 	private static final Map<Integer, Entity> ghosts = new HashMap<>();
+	// Game ids of the ghost entities, so the render mixin can tell ghosts from real entities
+	private static final Set<Integer> ghostEntityIds = new HashSet<>();
 	private static final Set<String> badTypes = new HashSet<>();
 
 	// Used by the mixin to stop sending position packets during replay
 	public static boolean isPlaying() {
 		return playing;
+	}
+
+	// Used by the render mixin: during replay hide every real entity
+	// except our own player and the recorded ghosts
+	public static boolean shouldHide(Entity e) {
+		if (!playing) return false;
+		if (e == Minecraft.getInstance().player) return false;
+		return !ghostEntityIds.contains(e.getId());
 	}
 
 	@Override
@@ -103,6 +113,7 @@ public class ExampleModClient implements ClientModInitializer {
 				recording = false;
 				playing = false;
 				ghosts.clear();
+				ghostEntityIds.clear();
 				shadow.clear();
 				handSaved = false;
 				savedHand = ItemStack.EMPTY;
@@ -294,6 +305,7 @@ public class ExampleModClient implements ClientModInitializer {
 				g = spawnGhost(level, ef);
 				if (g == null) continue;
 				ghosts.put(ef.id(), g);
+				ghostEntityIds.add(g.getId());
 				byte[] data = ef.data().length > 0 ? ef.data() : lookAhead(idx, ef.id());
 				applyData(g, data, level);
 			} else if (ef.data().length > 0) {
@@ -309,6 +321,7 @@ public class ExampleModClient implements ClientModInitializer {
 		while (it.hasNext()) {
 			Map.Entry<Integer, Entity> en = it.next();
 			if (!present.contains(en.getKey())) {
+				ghostEntityIds.remove(en.getValue().getId());
 				en.getValue().discard();
 				it.remove();
 			}
@@ -387,9 +400,11 @@ public class ExampleModClient implements ClientModInitializer {
 
 	private static void clearGhosts() {
 		for (Entity g : ghosts.values()) {
+			ghostEntityIds.remove(g.getId());
 			g.discard();
 		}
 		ghosts.clear();
+		ghostEntityIds.clear();
 	}
 
 	private void registerCommands() {
@@ -590,4 +605,4 @@ public class ExampleModClient implements ClientModInitializer {
 			frames = loaded;
 		}
 	}
-						   }
+	}
