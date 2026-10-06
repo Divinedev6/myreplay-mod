@@ -68,12 +68,19 @@ public class ExampleModClient implements ClientModInitializer {
 	private static boolean shadowOn = false;
 	private static int shadowTicks = 20 * 120; // default: 2 minutes
 
-	// During replay the held item is swapped temporarily, then restored
+	// State saved when a replay starts, restored when it ends
 	private static ItemStack savedHand = ItemStack.EMPTY;
 	private static boolean handSaved = false;
+	private static double savedX, savedY, savedZ;
+	private static float savedYaw, savedPitch;
 
 	private static final Map<Integer, Entity> ghosts = new HashMap<>();
 	private static final Set<String> badTypes = new HashSet<>();
+
+	// Used by the mixin to stop sending position packets during replay
+	public static boolean isPlaying() {
+		return playing;
+	}
 
 	@Override
 	public void onInitializeClient() {
@@ -94,9 +101,9 @@ public class ExampleModClient implements ClientModInitializer {
 				return;
 			}
 
-			// Replay stopped: restore the real held item
+			// Replay stopped: restore position and held item
 			if (!playing && handSaved) {
-				restoreHand(p);
+				restorePlayerState(p);
 			}
 
 			// Recording and Shadow Rewind (no capture during replay)
@@ -116,12 +123,17 @@ public class ExampleModClient implements ClientModInitializer {
 			if (playing) {
 				if (!handSaved) {
 					savedHand = p.getMainHandItem().copy();
+					savedX = p.getX();
+					savedY = p.getY();
+					savedZ = p.getZ();
+					savedYaw = p.getYRot();
+					savedPitch = p.getXRot();
 					handSaved = true;
 				}
 				if (playIndex >= frames.size()) {
 					playing = false;
 					clearGhosts();
-					restoreHand(p);
+					restorePlayerState(p);
 					say(p, "Replay finished.");
 					return;
 				}
@@ -131,6 +143,7 @@ public class ExampleModClient implements ClientModInitializer {
 				p.setYRot(f.yRot());
 				p.setXRot(f.xRot());
 				p.setDeltaMovement(Vec3.ZERO);
+				p.fallDistance = 0;
 				p.setShiftKeyDown(f.sneak());
 				p.setSprinting(f.sprint());
 				if (f.swing()) {
@@ -234,9 +247,15 @@ public class ExampleModClient implements ClientModInitializer {
 		return new byte[0];
 	}
 
-	private static void restoreHand(LocalPlayer p) {
+	private static void restorePlayerState(LocalPlayer p) {
 		if (handSaved) {
 			p.setItemInHand(InteractionHand.MAIN_HAND, savedHand);
+			p.setPos(savedX, savedY, savedZ);
+			p.setYRot(savedYaw);
+			p.setXRot(savedPitch);
+			p.setDeltaMovement(Vec3.ZERO);
+			p.fallDistance = 0;
+			p.hurtTime = 0;
 			handSaved = false;
 			savedHand = ItemStack.EMPTY;
 		}
@@ -510,4 +529,4 @@ public class ExampleModClient implements ClientModInitializer {
 			frames = loaded;
 		}
 	}
-	}
+					}
