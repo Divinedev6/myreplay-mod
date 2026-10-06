@@ -51,7 +51,7 @@ import java.util.Optional;
 import java.util.Set;
 
 public class ExampleModClient implements ClientModInitializer {
-	private static final int MAGIC = 0x52570006; // file format v6 (unchanged)
+	private static final int MAGIC = 0x52570007; // file format v7
 
 	// All equipment slots (head, chest, legs, feet, offhand, body armor, saddle...)
 	private static final EquipmentSlot[] SLOTS = EquipmentSlot.values();
@@ -65,9 +65,12 @@ public class ExampleModClient implements ClientModInitializer {
 							   int[] equip,
 							   byte[] data) {}
 
+	// pose = ordinal of the player's Pose (standing, crouching, swimming, elytra...)
 	private record Frame(double x, double y, double z, float yRot, float xRot,
 						 boolean swing, boolean sneak, boolean sprint,
 						 int hurt, int item,
+						 int pose, boolean swimming, boolean fallFlying,
+						 int[] equip,
 						 List<EntityFrame> ents) {}
 
 	private static List<Frame> frames = new ArrayList<>();
@@ -86,6 +89,7 @@ public class ExampleModClient implements ClientModInitializer {
 
 	// State saved when a replay starts, restored when it ends
 	private static ItemStack savedHand = ItemStack.EMPTY;
+	private static ItemStack[] savedEquip = new ItemStack[SLOTS.length];
 	private static boolean handSaved = false;
 	private static double savedX, savedY, savedZ;
 	private static float savedYaw, savedPitch;
@@ -149,7 +153,7 @@ public class ExampleModClient implements ClientModInitializer {
 				return;
 			}
 
-			// Replay stopped: restore position and held item
+			// Replay stopped: restore position, held item and armor
 			if (!playing && handSaved) {
 				restorePlayerState(p);
 			}
@@ -186,6 +190,9 @@ public class ExampleModClient implements ClientModInitializer {
 			if (playing) {
 				if (!handSaved) {
 					savedHand = p.getMainHandItem().copy();
+					for (int i = 0; i < SLOTS.length; i++) {
+						savedEquip[i] = p.getItemBySlot(SLOTS[i]).copy();
+					}
 					savedX = p.getX();
 					savedY = p.getY();
 					savedZ = p.getZ();
@@ -202,17 +209,41 @@ public class ExampleModClient implements ClientModInitializer {
 				}
 				int idx = playIndex;
 				Frame f = frames.get(playIndex++);
+
+				// Remember the old position so the game can see how far we moved
+				double oldX = p.getX();
+				double oldY = p.getY();
+				double oldZ = p.getZ();
+
 				p.setPos(f.x(), f.y(), f.z());
+				p.xo = oldX;
+				p.yo = oldY;
+				p.zo = oldZ;
 				p.setYRot(f.yRot());
 				p.setXRot(f.xRot());
+				// Body and head face where we look (visible in third person)
+				p.setYBodyRot(f.yRot());
+				p.setYHeadRot(f.yRot());
 				p.setDeltaMovement(Vec3.ZERO);
 				p.fallDistance = 0;
 				p.setShiftKeyDown(f.sneak());
-				if (f.sneak()) {
-					// Crouch pose lowers the camera in first person
-					p.setPose(Pose.CROUCHING);
-				}
 				p.setSprinting(f.sprint());
+
+				// Pose: standing, crouching, swimming, elytra flight
+				p.setPose(poseFor(f.pose()));
+				p.setSwimming(f.swimming());
+				if (f.fallFlying() && !p.isFallFlying()) {
+					p.startFallFlying();
+				} else if (!f.fallFlying() && p.isFallFlying()) {
+					p.stopFallFlying();
+				}
+
+				// Armor and offhand (an elytra needs the chest slot item)
+				applyPlayerEquipment(p, f.equip());
+
+				// Walking/running/swimming/flying limb animation (visible in third person)
+				p.calculateEntityAnimation(f.swimming() || f.fallFlying());
+
 				if (f.swing()) {
 					p.swing(InteractionHand.MAIN_HAND);
 				}
@@ -232,6 +263,39 @@ public class ExampleModClient implements ClientModInitializer {
 				updateGhosts(level, f, idx);
 			}
 		});
+	}
+
+	// Only these poses are replayed on the player; others fall back to standing
+	private static Pose poseFor(int ordinal) {
+		Pose[] all = Pose.values();
+		if (ordinal < 0 || ordinal >= all.length) return Pose.STANDING;
+		Pose pose = all[ordinal];
+		if (pose == Pose.FALL_FLYING || pose == Pose.SWIMMING || pose == Pose.CROUCHING) {
+			return pose;
+		}
+		return Pose.STANDING;
+	}
+
+	private static boolean isPlayerWornSlot(EquipmentSlot s) {
+		return s == EquipmentSlot.HEAD || s == EquipmentSlot.CHEST
+			|| s == EquipmentSlot.LEGS || s == EquipmentSlot.FEET
+			|| s == EquipmentSlot.OFFHAND;
+	}
+
+	// Temporarily wear the recorded armor/offhand (client side only)
+	private static void applyPlayerEquipment(LocalPlayer p, int[] equip) {
+		for (int i = 0; i < SLOTS.length && i < equip.length; i++) {
+			EquipmentSlot s = SLOTS[i];
+			if (!isPlayerWornSlot(s)) continue;
+			Item it = BuiltInRegistries.ITEM.byId(equip[i]);
+			if (it != null && !p.getItemBySlot(s).is(it)) {
+				try {
+					p.setItemSlot(s, new ItemStack(it));
+				} catch (Exception ex) {
+					// ignore
+				}
+			}
+		}
 	}
 
 	private static Frame capture(LocalPlayer p, ClientLevel level) {
@@ -277,10 +341,19 @@ public class ExampleModClient implements ClientModInitializer {
 
 		boolean pSwing = p.swinging && p.swingTime == 0;
 		int pItem = BuiltInRegistries.ITEM.getId(p.getMainHandItem().getItem());
+
+		int[] pEquip = new int[SLOTS.length];
+		for (int i = 0; i < SLOTS.length; i++) {
+			pEquip[i] = BuiltInRegistries.ITEM.getId(p.getItemBySlot(SLOTS[i]).getItem());
+		}
+
 		return new Frame(
 			p.getX(), p.getY(), p.getZ(), p.getYRot(), p.getXRot(),
 			pSwing, p.isShiftKeyDown(), p.isSprinting(),
-			p.hurtTime, pItem, list);
+			p.hurtTime, pItem,
+			p.getPose().ordinal(), p.isSwimming(), p.isFallFlying(),
+			pEquip,
+			list);
 	}
 
 	// Turn the entity's synced data into bytes
@@ -328,12 +401,25 @@ public class ExampleModClient implements ClientModInitializer {
 	private static void restorePlayerState(LocalPlayer p) {
 		if (handSaved) {
 			p.setItemInHand(InteractionHand.MAIN_HAND, savedHand);
+			for (int i = 0; i < SLOTS.length; i++) {
+				if (!isPlayerWornSlot(SLOTS[i]) || savedEquip[i] == null) continue;
+				try {
+					p.setItemSlot(SLOTS[i], savedEquip[i]);
+				} catch (Exception ex) {
+					// ignore
+				}
+			}
 			p.setPos(savedX, savedY, savedZ);
 			p.setYRot(savedYaw);
 			p.setXRot(savedPitch);
 			p.setDeltaMovement(Vec3.ZERO);
 			p.fallDistance = 0;
 			p.hurtTime = 0;
+			p.setPose(Pose.STANDING);
+			p.setSwimming(false);
+			if (p.isFallFlying()) {
+				p.stopFallFlying();
+			}
 			handSaved = false;
 			savedHand = ItemStack.EMPTY;
 		}
@@ -566,6 +652,13 @@ public class ExampleModClient implements ClientModInitializer {
 				out.writeBoolean(f.sprint());
 				out.writeInt(f.hurt());
 				out.writeInt(f.item());
+				out.writeInt(f.pose());
+				out.writeBoolean(f.swimming());
+				out.writeBoolean(f.fallFlying());
+				out.writeInt(f.equip().length);
+				for (int v : f.equip()) {
+					out.writeInt(v);
+				}
 				out.writeInt(f.ents().size());
 				for (EntityFrame e : f.ents()) {
 					out.writeInt(e.id());
@@ -611,6 +704,17 @@ public class ExampleModClient implements ClientModInitializer {
 				boolean sprint = in.readBoolean();
 				int hurt = in.readInt();
 				int item = in.readInt();
+				int pose = in.readInt();
+				boolean swimming = in.readBoolean();
+				boolean fallFlying = in.readBoolean();
+				int pEqLen = in.readInt();
+				if (pEqLen < 0 || pEqLen > 32) {
+					throw new IOException("Corrupt replay file");
+				}
+				int[] pEquip = new int[pEqLen];
+				for (int j = 0; j < pEqLen; j++) {
+					pEquip[j] = in.readInt();
+				}
 				int count = in.readInt();
 				List<EntityFrame> ents = new ArrayList<>();
 				for (int k = 0; k < count; k++) {
@@ -644,9 +748,10 @@ public class ExampleModClient implements ClientModInitializer {
 					ents.add(new EntityFrame(id, type, ex, ey, ez, eyRot, exRot, head,
 						eSwing, eHurt, eItem, eSneak, eSprint, equip, data));
 				}
-				loaded.add(new Frame(x, y, z, yRot, xRot, swing, sneak, sprint, hurt, item, ents));
+				loaded.add(new Frame(x, y, z, yRot, xRot, swing, sneak, sprint, hurt, item,
+					pose, swimming, fallFlying, pEquip, ents));
 			}
 			frames = loaded;
 		}
 	}
-		}
+													 }
