@@ -20,6 +20,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
 import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.resources.Identifier;
+import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntitySpawnReason;
@@ -51,7 +52,7 @@ import java.util.Optional;
 import java.util.Set;
 
 public class ExampleModClient implements ClientModInitializer {
-	private static final int MAGIC = 0x52570007; // file format v7
+	private static final int MAGIC = 0x52570007; // file format v7 (unchanged)
 
 	// All equipment slots (head, chest, legs, feet, offhand, body armor, saddle...)
 	private static final EquipmentSlot[] SLOTS = EquipmentSlot.values();
@@ -94,6 +95,14 @@ public class ExampleModClient implements ClientModInitializer {
 	private static double savedX, savedY, savedZ;
 	private static float savedYaw, savedPitch;
 
+	// Replay body/head rotation (body turns slowly toward the walking direction)
+	private static float bodyYaw = 0;
+	private static float headYaw = 0;
+
+	// Replay helpers for the mixins
+	private static boolean animBypass = false;
+	private static boolean replayCrouch = false;
+
 	private static final Map<Integer, Entity> ghosts = new HashMap<>();
 	// Game ids of the ghost entities, so the render mixin can tell ghosts from real entities
 	private static final Set<Integer> ghostEntityIds = new HashSet<>();
@@ -110,6 +119,17 @@ public class ExampleModClient implements ClientModInitializer {
 		if (!playing) return false;
 		if (e == Minecraft.getInstance().player) return false;
 		return !ghostEntityIds.contains(e.getId());
+	}
+
+	// Used by the animation mixin: during replay the mod updates the player's
+	// walk animation itself, so the game's own update is skipped
+	public static boolean shouldBlockVanillaAnimation(LivingEntity e) {
+		return playing && !animBypass && e == Minecraft.getInstance().player;
+	}
+
+	// Used by the crouch mixin: is the replayed player crouching right now
+	public static boolean replayCrouching() {
+		return replayCrouch;
 	}
 
 	// Used by the name screen
@@ -145,6 +165,7 @@ public class ExampleModClient implements ClientModInitializer {
 				// Left the world
 				recording = false;
 				playing = false;
+				replayCrouch = false;
 				ghosts.clear();
 				ghostEntityIds.clear();
 				shadow.clear();
@@ -221,16 +242,53 @@ public class ExampleModClient implements ClientModInitializer {
 				p.zo = oldZ;
 				p.setYRot(f.yRot());
 				p.setXRot(f.xRot());
-				// Body and head face where we look (visible in third person)
-				p.setYBodyRot(f.yRot());
-				p.setYHeadRot(f.yRot());
+
+				// Body turns toward the walking direction, head follows the camera
+				// (like the real game, so the body doesn't snap with the camera)
+				float yaw = f.yRot();
+				if (idx == 0) {
+					bodyYaw = yaw;
+					headYaw = yaw;
+				}
+				float prevBody = bodyYaw;
+				float prevHead = headYaw;
+
+				double dx = f.x() - oldX;
+				double dz = f.z() - oldZ;
+				float target = bodyYaw;
+				if (dx * dx + dz * dz > 0.0025) {
+					float moveYaw = (float) (Math.atan2(dz, dx) * 57.29577951308232) - 90.0F;
+					float diff = Math.abs(Mth.wrapDegrees(yaw) - moveYaw);
+					if (diff > 95.0F && diff < 265.0F) {
+						moveYaw -= 180.0F;
+					}
+					target = moveYaw;
+				}
+				bodyYaw += Mth.wrapDegrees(target - bodyYaw) * 0.3F;
+
+				// The head can't turn more than 75 degrees away from the body
+				float headDiff = Mth.wrapDegrees(yaw - bodyYaw);
+				if (headDiff > 75.0F) {
+					bodyYaw = yaw - 75.0F;
+				} else if (headDiff < -75.0F) {
+					bodyYaw = yaw + 75.0F;
+				}
+				headYaw = yaw;
+
+				p.yBodyRotO = prevBody;
+				p.yBodyRot = bodyYaw;
+				p.yHeadRotO = prevHead;
+				p.yHeadRot = headYaw;
+
 				p.setDeltaMovement(Vec3.ZERO);
 				p.fallDistance = 0;
 				p.setShiftKeyDown(f.sneak());
 				p.setSprinting(f.sprint());
 
 				// Pose: standing, crouching, swimming, elytra flight
-				p.setPose(poseFor(f.pose()));
+				Pose pose = poseFor(f.pose());
+				p.setPose(pose);
+				replayCrouch = (pose == Pose.CROUCHING);
 				p.setSwimming(f.swimming());
 				if (f.fallFlying() && !p.isFallFlying()) {
 					p.startFallFlying();
@@ -242,7 +300,9 @@ public class ExampleModClient implements ClientModInitializer {
 				applyPlayerEquipment(p, f.equip());
 
 				// Walking/running/swimming/flying limb animation (visible in third person)
+				animBypass = true;
 				p.calculateEntityAnimation(f.swimming() || f.fallFlying());
+				animBypass = false;
 
 				if (f.swing()) {
 					p.swing(InteractionHand.MAIN_HAND);
@@ -420,6 +480,7 @@ public class ExampleModClient implements ClientModInitializer {
 			if (p.isFallFlying()) {
 				p.stopFallFlying();
 			}
+			replayCrouch = false;
 			handSaved = false;
 			savedHand = ItemStack.EMPTY;
 		}
@@ -754,4 +815,4 @@ public class ExampleModClient implements ClientModInitializer {
 			frames = loaded;
 		}
 	}
-													 }
+					}
