@@ -103,10 +103,6 @@ public class ExampleModClient implements ClientModInitializer {
 	private static boolean animBypass = false;
 	private static boolean replayCrouch = false;
 
-	// Debug (elytra), will be removed later
-	private static boolean dbgWasGliding = false;
-	private static int dbgFlyFrames = 0;
-
 	private static final Map<Integer, Entity> ghosts = new HashMap<>();
 	// Game ids of the ghost entities, so the render mixin can tell ghosts from real entities
 	private static final Set<Integer> ghostEntityIds = new HashSet<>();
@@ -191,7 +187,6 @@ public class ExampleModClient implements ClientModInitializer {
 					clearGhosts();
 					frames = new ArrayList<>();
 					recording = true;
-					dbgWasGliding = false;
 					say(p, "Recording started! Press G again to stop.");
 				} else {
 					recording = false;
@@ -204,14 +199,6 @@ public class ExampleModClient implements ClientModInitializer {
 				Frame current = capture(p, level);
 				if (recording) {
 					frames.add(current);
-
-					// Debug: tell when gliding is picked up by the recording
-					boolean glidingNow = p.isFallFlying();
-					if (glidingNow && !dbgWasGliding) {
-						say(p, "[debug] rec: gliding started, pose=" + p.getPose()
-							+ ", chest=" + p.getItemBySlot(EquipmentSlot.CHEST).getItem());
-					}
-					dbgWasGliding = glidingNow;
 				}
 				if (shadowOn) {
 					shadow.addLast(current);
@@ -232,7 +219,6 @@ public class ExampleModClient implements ClientModInitializer {
 					savedZ = p.getZ();
 					savedYaw = p.getYRot();
 					savedPitch = p.getXRot();
-					dbgFlyFrames = 0;
 					handSaved = true;
 				}
 				if (playIndex >= frames.size()) {
@@ -244,19 +230,6 @@ public class ExampleModClient implements ClientModInitializer {
 				}
 				int idx = playIndex;
 				Frame f = frames.get(playIndex++);
-
-				// Debug: does the game keep our elytra flag between ticks?
-				boolean gameFlagBefore = p.isFallFlying();
-				if (f.fallFlying()) {
-					dbgFlyFrames++;
-					if (dbgFlyFrames == 3) {
-						say(p, "[debug] replay: flying frame 3, game flag=" + gameFlagBefore
-							+ ", pose=" + p.getPose()
-							+ ", chest=" + p.getItemBySlot(EquipmentSlot.CHEST).getItem());
-					}
-				} else {
-					dbgFlyFrames = 0;
-				}
 
 				// Remember the old position so the game can see how far we moved
 				double oldX = p.getX();
@@ -312,6 +285,9 @@ public class ExampleModClient implements ClientModInitializer {
 				p.setShiftKeyDown(f.sneak());
 				p.setSprinting(f.sprint());
 
+				// Armor and offhand first: the game only allows gliding with an elytra on the chest
+				applyPlayerEquipment(p, f.equip());
+
 				// Pose: standing, crouching, swimming, elytra flight
 				Pose pose = poseFor(f.pose());
 				p.setPose(pose);
@@ -322,9 +298,6 @@ public class ExampleModClient implements ClientModInitializer {
 				} else if (!f.fallFlying() && p.isFallFlying()) {
 					p.stopFallFlying();
 				}
-
-				// Armor and offhand (an elytra needs the chest slot item)
-				applyPlayerEquipment(p, f.equip());
 
 				// Walking/running/swimming/flying limb animation (visible in third person)
 				animBypass = true;
@@ -633,7 +606,6 @@ public class ExampleModClient implements ClientModInitializer {
 					frames = new ArrayList<>();
 					playing = false;
 					recording = true;
-					dbgWasGliding = false;
 					ctx.getSource().sendFeedback(Component.literal("Recording started!"));
 					return 1;
 				}))
