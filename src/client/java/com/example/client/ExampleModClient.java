@@ -99,6 +99,9 @@ public class ExampleModClient implements ClientModInitializer {
 	private static float bodyYaw = 0;
 	private static float headYaw = 0;
 
+	// Position of the previous replay frame
+	private static double prevFrameX, prevFrameY, prevFrameZ;
+
 	// Replay helpers for the mixins
 	private static boolean animBypass = false;
 	private static boolean replayCrouch = false;
@@ -231,10 +234,15 @@ public class ExampleModClient implements ClientModInitializer {
 				int idx = playIndex;
 				Frame f = frames.get(playIndex++);
 
-				// Remember the old position so the game can see how far we moved
-				double oldX = p.getX();
-				double oldY = p.getY();
-				double oldZ = p.getZ();
+				// Position of the previous replay frame. We don't use the player's
+				// current position here, because the game moves the player a little
+				// during its own tick, which made the speed (and camera) jump around.
+				double oldX = (idx == 0) ? f.x() : prevFrameX;
+				double oldY = (idx == 0) ? f.y() : prevFrameY;
+				double oldZ = (idx == 0) ? f.z() : prevFrameZ;
+				prevFrameX = f.x();
+				prevFrameY = f.y();
+				prevFrameZ = f.z();
 
 				p.setPos(f.x(), f.y(), f.z());
 				p.xo = oldX;
@@ -611,6 +619,7 @@ public class ExampleModClient implements ClientModInitializer {
 					return 1;
 				}))
 				.then(ClientCommandManager.literal("play")
+					.then(ClientCommandManager.literal("play")
 					.then(ClientCommandManager.argument("name", StringArgumentType.word()).executes(ctx -> {
 						String name = StringArgumentType.getString(ctx, "name");
 						try {
