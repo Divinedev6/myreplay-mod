@@ -280,13 +280,12 @@ public class ExampleModClient implements ClientModInitializer {
 				p.yHeadRotO = prevHead;
 				p.yHeadRot = headYaw;
 
-				p.setDeltaMovement(Vec3.ZERO);
+				// The real speed of this tick (the elytra wings and body banking
+				// look at the speed direction, so it must not be zero)
+				p.setDeltaMovement(f.x() - oldX, f.y() - oldY, f.z() - oldZ);
 				p.fallDistance = 0;
 				p.setShiftKeyDown(f.sneak());
 				p.setSprinting(f.sprint());
-
-				// Armor and offhand first: the game only allows gliding with an elytra on the chest
-				applyPlayerEquipment(p, f.equip());
 
 				// Pose: standing, crouching, swimming, elytra flight
 				Pose pose = poseFor(f.pose());
@@ -298,6 +297,9 @@ public class ExampleModClient implements ClientModInitializer {
 				} else if (!f.fallFlying() && p.isFallFlying()) {
 					p.stopFallFlying();
 				}
+
+				// Armor and offhand (an elytra needs the chest slot item)
+				applyPlayerEquipment(p, f.equip());
 
 				// Walking/running/swimming/flying limb animation (visible in third person)
 				animBypass = true;
@@ -601,14 +603,6 @@ public class ExampleModClient implements ClientModInitializer {
 	private void registerCommands() {
 		ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
 			dispatcher.register(ClientCommandManager.literal("rw")
-				.then(ClientCommandManager.literal("start").executes(ctx -> {
-					clearGhosts();
-					frames = new ArrayList<>();
-					playing = false;
-					recording = true;
-					ctx.getSource().sendFeedback(Component.literal("Recording started!"));
-					return 1;
-				}))
 				.then(ClientCommandManager.literal("cancel").executes(ctx -> {
 					recording = false;
 					playing = false;
@@ -616,19 +610,6 @@ public class ExampleModClient implements ClientModInitializer {
 					ctx.getSource().sendFeedback(Component.literal("Cancelled."));
 					return 1;
 				}))
-				.then(ClientCommandManager.literal("stop")
-					.then(ClientCommandManager.argument("name", StringArgumentType.word()).executes(ctx -> {
-						String name = StringArgumentType.getString(ctx, "name");
-						recording = false;
-						try {
-							save(name, frames);
-							ctx.getSource().sendFeedback(Component.literal(
-								"Saved: " + name + " (" + frames.size() + " ticks)"));
-						} catch (IOException e) {
-							ctx.getSource().sendFeedback(Component.literal("Save error: " + e.getMessage()));
-						}
-						return 1;
-					})))
 				.then(ClientCommandManager.literal("play")
 					.then(ClientCommandManager.argument("name", StringArgumentType.word()).executes(ctx -> {
 						String name = StringArgumentType.getString(ctx, "name");
@@ -815,4 +796,4 @@ public class ExampleModClient implements ClientModInitializer {
 			frames = loaded;
 		}
 	}
-	}
+				}
