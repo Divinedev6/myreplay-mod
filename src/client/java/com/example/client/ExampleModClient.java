@@ -733,4 +733,75 @@ public class ExampleModClient implements ClientModInitializer {
 				}
 			}
 		}
-								}
+	}
+
+	private static void load(String name) throws IOException {
+		try (DataInputStream in = new DataInputStream(
+				new BufferedInputStream(Files.newInputStream(dir().resolve(name + ".rw"))))) {
+			if (in.readInt() != MAGIC) {
+				throw new IOException("This is an old file format, please record a new one");
+			}
+			int n = in.readInt();
+			List<Frame> loaded = new ArrayList<>();
+			for (int i = 0; i < n; i++) {
+				double x = in.readDouble();
+				double y = in.readDouble();
+				double z = in.readDouble();
+				float yRot = in.readFloat();
+				float xRot = in.readFloat();
+				boolean swing = in.readBoolean();
+				boolean sneak = in.readBoolean();
+				boolean sprint = in.readBoolean();
+				int hurt = in.readInt();
+				int item = in.readInt();
+				int pose = in.readInt();
+				boolean swimming = in.readBoolean();
+				boolean fallFlying = in.readBoolean();
+				int pEqLen = in.readInt();
+				if (pEqLen < 0 || pEqLen > 32) {
+					throw new IOException("Corrupt replay file");
+				}
+				int[] pEquip = new int[pEqLen];
+				for (int j = 0; j < pEqLen; j++) {
+					pEquip[j] = in.readInt();
+				}
+				int count = in.readInt();
+				List<EntityFrame> ents = new ArrayList<>();
+				for (int k = 0; k < count; k++) {
+					int id = in.readInt();
+					String type = in.readUTF();
+					double ex = in.readDouble();
+					double ey = in.readDouble();
+					double ez = in.readDouble();
+					float eyRot = in.readFloat();
+					float exRot = in.readFloat();
+					float head = in.readFloat();
+					boolean eSwing = in.readBoolean();
+					int eHurt = in.readInt();
+					int eItem = in.readInt();
+					boolean eSneak = in.readBoolean();
+					boolean eSprint = in.readBoolean();
+					int eqLen = in.readInt();
+					if (eqLen < 0 || eqLen > 32) {
+						throw new IOException("Corrupt replay file");
+					}
+					int[] equip = new int[eqLen];
+					for (int j = 0; j < eqLen; j++) {
+						equip[j] = in.readInt();
+					}
+					int len = in.readInt();
+					if (len < 0 || len > 100000) {
+						throw new IOException("Corrupt replay file");
+					}
+					byte[] data = new byte[len];
+					in.readFully(data);
+					ents.add(new EntityFrame(id, type, ex, ey, ez, eyRot, exRot, head,
+						eSwing, eHurt, eItem, eSneak, eSprint, equip, data));
+				}
+				loaded.add(new Frame(x, y, z, yRot, xRot, swing, sneak, sprint, hurt, item,
+					pose, swimming, fallFlying, pEquip, ents));
+			}
+			frames = loaded;
+		}
+	}
+}
