@@ -16,7 +16,9 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
 import net.minecraft.network.syncher.SynchedEntityData;
@@ -33,6 +35,8 @@ import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.phys.Vec3;
 import org.lwjgl.glfw.GLFW;
 
@@ -121,6 +125,9 @@ public class ExampleModClient implements ClientModInitializer {
 
 	// Position of the previous replay frame
 	private static double prevFrameX, prevFrameY, prevFrameZ;
+	// Step 2: terrain replay
+	private static boolean terrainApplied = false;
+	private static final List<Long> addedChunks = new ArrayList<>();
 
 	// Replay helpers for the mixins
 	private static boolean animBypass = false;
@@ -242,6 +249,10 @@ public class ExampleModClient implements ClientModInitializer {
 			}
 
 			if (playing) {
+				if (!terrainApplied) {
+					applyTerrain(level);
+					terrainApplied = true;
+				}
 				if (!handSaved) {
 					savedHand = p.getMainHandItem().copy();
 					for (int i = 0; i < SLOTS.length; i++) {
@@ -257,6 +268,8 @@ public class ExampleModClient implements ClientModInitializer {
 				if (playIndex >= frames.size()) {
 					playing = false;
 					clearGhosts();
+					removeTerrain(level);
+					terrainApplied = false;
 					restorePlayerState(p);
 					say(p, "Replay finished.");
 					return;
@@ -733,6 +746,7 @@ public class ExampleModClient implements ClientModInitializer {
 							recording = false;
 							clearGhosts();
 							playIndex = 0;
+							terrainApplied = false;
 							playing = true;
 							ctx.getSource().sendFeedback(Component.literal("Playing replay: " + name));
 						} catch (IOException e) {
@@ -950,5 +964,71 @@ public class ExampleModClient implements ClientModInitializer {
 		} catch (ZipException ex) {
 			throw new IOException("This is an old file format, please record a new one");
 		}
+	}
+
+	// --- Step 2: show saved terrain during replay ---
+
+	private static void applyTerrain(ClientLevel level) {
+		if (loadedTerrain.isEmpty()) return;
+		var biomes = level.registryAccess().lookupOrThrow(Registries.BIOME);
+		int minSection = level.getMinSectionY();
+		int maxSection = level.getMaxSectionY();
+		int added = 0;
+
+		for (TerrainChunk t : loadedTerrain.values()) {
+			// A real chunk is already loaded here, don't touch it
+			if (level.hasChunk(t.cx(), t.cz())) continue;
+
+			int[] ids = decodeTerrain(t);
+			FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+			for (int sy = minSection; sy < maxSection; sy++) {
+				LevelChunkSection section = new LevelChunkSection(biomes);
+				for (int ly = 0; ly < 16; ly++) {
+					int idx = ((sy << 4) + ly) - t.yStart();
+					if (idx < 0 || idx >= t.layers()) continue; // outside saved range
+					for (int z = 0; z < 16; z++) {
+						for (int x = 0; x < 16; x++) {
+							int id = ids[(idx * 16 + z) * 16 + x];
+							if (id != 0) {
+								section.setBlockState(x, ly, z, Block.stateById(id));
+							}
+						}
+					}
+				}
+				section.write(buf);
+			}
+			level.getChunkSource().replaceWithPacketData(t.cx(), t.cz(), buf, Map.of(), info -> {});
+			addedChunks.add(chunkKey(t.cx(), t.cz()));
+			added++;
+		}
+
+		LocalPlayer p = Minecraft.getInstance().player;
+		if (p != null) {
+			say(p, "Terrain shown: " + added + " chunks");
+		}
+	}
+
+	// Turns the saved (block id, run length) pairs back into one id array
+	private static int[] decodeTerrain(TerrainChunk t) {
+		int[] out = new int[t.layers() * 256];
+		int pos = 0;
+		for (int i = 0; i + 1 < t.rle().length; i += 2) {
+			int id = t.rle()[i];
+			int run = t.rle()[i + 1];
+			for (int k = 0; k < run && pos < out.length; k++) {
+				out[pos++] = id;
+			}
+		}
+		return out;
+	}
+
+	// Removes only the chunks we added, so the real world stays intact
+	private static void removeTerrain(ClientLevel level) {
+		for (long key : addedChunks) {
+			int cx = (int) (key >> 32);
+			int cz = (int) key;
+			level.getChunkSource().drop(new ChunkPos(cx, cz));
+		}
+		addedChunks.clear();
 	}
 }
