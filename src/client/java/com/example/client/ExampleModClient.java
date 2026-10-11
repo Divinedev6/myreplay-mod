@@ -16,7 +16,6 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.core.registries.Registries;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.chat.Component;
@@ -37,6 +36,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.world.phys.Vec3;
 import org.lwjgl.glfw.GLFW;
 
@@ -970,7 +970,6 @@ public class ExampleModClient implements ClientModInitializer {
 
 	private static void applyTerrain(ClientLevel level) {
 		if (loadedTerrain.isEmpty()) return;
-		var biomes = level.registryAccess().lookupOrThrow(Registries.BIOME);
 		int minSection = level.getMinSectionY();
 		int maxSection = level.getMaxSectionY();
 		int added = 0;
@@ -982,7 +981,7 @@ public class ExampleModClient implements ClientModInitializer {
 			int[] ids = decodeTerrain(t);
 			FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
 			for (int sy = minSection; sy < maxSection; sy++) {
-				LevelChunkSection section = new LevelChunkSection(biomes);
+				LevelChunkSection section = new LevelChunkSection(PalettedContainerFactory.create(level.registryAccess()));
 				for (int ly = 0; ly < 16; ly++) {
 					int idx = ((sy << 4) + ly) - t.yStart();
 					if (idx < 0 || idx >= t.layers()) continue; // outside saved range
