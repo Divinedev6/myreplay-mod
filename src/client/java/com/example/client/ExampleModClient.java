@@ -14,6 +14,7 @@ import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.chat.Component;
@@ -31,6 +32,7 @@ import net.minecraft.world.entity.Pose;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.phys.Vec3;
 import org.lwjgl.glfw.GLFW;
 
@@ -43,19 +45,29 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
+import java.util.zip.ZipException;
 
 public class ExampleModClient implements ClientModInitializer {
-	private static final int MAGIC = 0x52570007; // file format v7 (unchanged)
+	private static final int MAGIC = 0x52570008; // file format v8 (gzip + terrain)
 
 	// All equipment slots (head, chest, legs, feet, offhand, body armor, saddle...)
 	private static final EquipmentSlot[] SLOTS = EquipmentSlot.values();
+
+	// Terrain saving: how far up and down from the player we save blocks
+	private static final int TERRAIN_RANGE = 32;
+	// At most this many new chunks are saved per tick (so the game doesn't freeze)
+	private static final int TERRAIN_PER_TICK = 4;
 
 	// data = entity's synced data (colour, variant, baby, etc.), only present every 20 ticks
 	// equip = item id for each equipment slot, in the order of SLOTS
@@ -74,11 +86,19 @@ public class ExampleModClient implements ClientModInitializer {
 						 int[] equip,
 						 List<EntityFrame> ents) {}
 
+	// One saved chunk column: blocks from yStart for "layers" layers.
+	// rle = pairs of (block state id, how many times in a row)
+	private record TerrainChunk(int cx, int cz, int yStart, int layers, int[] rle) {}
+
 	private static List<Frame> frames = new ArrayList<>();
 	private static boolean recording = false;
 	private static boolean playing = false;
 	private static int playIndex = 0;
 	private static long captureTick = 0;
+
+	// Terrain saved while recording, and terrain loaded from a replay file
+	private static final Map<Long, TerrainChunk> terrain = new LinkedHashMap<>();
+	private static Map<Long, TerrainChunk> loadedTerrain = new LinkedHashMap<>();
 
 	// Key to start/stop recording (default: G)
 	private static KeyMapping toggleKey;
@@ -137,7 +157,14 @@ public class ExampleModClient implements ClientModInitializer {
 
 	// Used by the name screen
 	public static void saveFrames(String name) throws IOException {
-		save(name, frames);
+		save(name, frames, terrain);
+
+		// Tell how much terrain was saved (so we can check the file size)
+		LocalPlayer p = Minecraft.getInstance().player;
+		if (p != null) {
+			long kb = Files.size(dir().resolve(name + ".rw")) / 1024;
+			say(p, "Terrain: " + terrain.size() + " chunks saved, file size " + kb + " KB");
+		}
 	}
 
 	public static int frameCount() {
@@ -146,6 +173,7 @@ public class ExampleModClient implements ClientModInitializer {
 
 	public static void discardRecording() {
 		frames = new ArrayList<>();
+		terrain.clear();
 	}
 
 	@Override
@@ -189,6 +217,7 @@ public class ExampleModClient implements ClientModInitializer {
 				} else if (!recording) {
 					clearGhosts();
 					frames = new ArrayList<>();
+					terrain.clear();
 					recording = true;
 					say(p, "Recording started! Press G again to stop.");
 				} else {
@@ -202,6 +231,7 @@ public class ExampleModClient implements ClientModInitializer {
 				Frame current = capture(p, level);
 				if (recording) {
 					frames.add(current);
+					captureTerrain(p, level);
 				}
 				if (shadowOn) {
 					shadow.addLast(current);
@@ -333,6 +363,83 @@ public class ExampleModClient implements ClientModInitializer {
 				updateGhosts(level, f, idx);
 			}
 		});
+	}
+
+	// ---------------------------------------------------------------
+	// Terrain saving (step 1: only saves, the replay doesn't use it yet)
+	// ---------------------------------------------------------------
+
+	private static long chunkKey(int cx, int cz) {
+		return (((long) cx) << 32) ^ (cz & 0xFFFFFFFFL);
+	}
+
+	// Saves the chunks around the player (inside the render distance) that
+	// were not saved yet, a few per tick.
+	private static void captureTerrain(LocalPlayer p, ClientLevel level) {
+		int rd = Minecraft.getInstance().options.renderDistance().get();
+		int pcx = p.getBlockX() >> 4;
+		int pcz = p.getBlockZ() >> 4;
+		int yStart = p.getBlockY() - TERRAIN_RANGE;
+		int layers = TERRAIN_RANGE * 2 + 1;
+		int budget = TERRAIN_PER_TICK;
+
+		// Nearest chunks first (ring by ring)
+		for (int r = 0; r <= rd && budget > 0; r++) {
+			for (int dx = -r; dx <= r && budget > 0; dx++) {
+				for (int dz = -r; dz <= r && budget > 0; dz++) {
+					if (Math.max(Math.abs(dx), Math.abs(dz)) != r) continue;
+					int cx = pcx + dx;
+					int cz = pcz + dz;
+					long key = chunkKey(cx, cz);
+					if (terrain.containsKey(key)) continue;
+					if (!level.hasChunk(cx, cz)) continue;
+					terrain.put(key, readChunk(level, cx, cz, yStart, layers));
+					budget--;
+				}
+			}
+		}
+	}
+
+	// Reads the blocks of one chunk column and packs them as (id, run length) pairs
+	private static TerrainChunk readChunk(ClientLevel level, int cx, int cz, int yStart, int layers) {
+		BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+		int[] buf = new int[1024];
+		int n = 0;
+		int lastId = -1;
+		int run = 0;
+
+		for (int y = yStart; y < yStart + layers; y++) {
+			for (int z = 0; z < 16; z++) {
+				for (int x = 0; x < 16; x++) {
+					int id = 0; // 0 = air
+					if (!level.isOutsideBuildHeight(y)) {
+						pos.set((cx << 4) + x, y, (cz << 4) + z);
+						id = Block.getId(level.getBlockState(pos));
+					}
+					if (id == lastId) {
+						run++;
+					} else {
+						if (run > 0) {
+							if (n + 2 > buf.length) {
+								buf = Arrays.copyOf(buf, buf.length * 2);
+							}
+							buf[n++] = lastId;
+							buf[n++] = run;
+						}
+						lastId = id;
+						run = 1;
+					}
+				}
+			}
+		}
+		if (run > 0) {
+			if (n + 2 > buf.length) {
+				buf = Arrays.copyOf(buf, buf.length * 2);
+			}
+			buf[n++] = lastId;
+			buf[n++] = run;
+		}
+		return new TerrainChunk(cx, cz, yStart, layers, Arrays.copyOf(buf, n));
 	}
 
 	// Only these poses are replayed on the player; others fall back to standing
@@ -643,7 +750,8 @@ public class ExampleModClient implements ClientModInitializer {
 						}
 						List<Frame> copy = new ArrayList<>(shadow);
 						try {
-							save(name, copy);
+							// Shadow Rewind doesn't save terrain yet
+							save(name, copy, new LinkedHashMap<>());
 							ctx.getSource().sendFeedback(Component.literal(
 								"Shadow saved: " + name + " (" + (copy.size() / 20) + " seconds)"));
 						} catch (IOException e) {
@@ -686,9 +794,9 @@ public class ExampleModClient implements ClientModInitializer {
 		return d;
 	}
 
-	private static void save(String name, List<Frame> data) throws IOException {
-		try (DataOutputStream out = new DataOutputStream(
-				new BufferedOutputStream(Files.newOutputStream(dir().resolve(name + ".rw"))))) {
+	private static void save(String name, List<Frame> data, Map<Long, TerrainChunk> terr) throws IOException {
+		try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(
+				new GZIPOutputStream(Files.newOutputStream(dir().resolve(name + ".rw")))))) {
 			out.writeInt(MAGIC);
 			out.writeInt(data.size());
 			for (Frame f : data) {
@@ -732,12 +840,25 @@ public class ExampleModClient implements ClientModInitializer {
 					out.write(e.data());
 				}
 			}
+
+			// Terrain
+			out.writeInt(terr.size());
+			for (TerrainChunk t : terr.values()) {
+				out.writeInt(t.cx());
+				out.writeInt(t.cz());
+				out.writeInt(t.yStart());
+				out.writeInt(t.layers());
+				out.writeInt(t.rle().length);
+				for (int v : t.rle()) {
+					out.writeInt(v);
+				}
+			}
 		}
 	}
 
 	private static void load(String name) throws IOException {
-		try (DataInputStream in = new DataInputStream(
-				new BufferedInputStream(Files.newInputStream(dir().resolve(name + ".rw"))))) {
+		try (DataInputStream in = new DataInputStream(new BufferedInputStream(
+				new GZIPInputStream(Files.newInputStream(dir().resolve(name + ".rw")))))) {
 			if (in.readInt() != MAGIC) {
 				throw new IOException("This is an old file format, please record a new one");
 			}
@@ -801,7 +922,33 @@ public class ExampleModClient implements ClientModInitializer {
 				loaded.add(new Frame(x, y, z, yRot, xRot, swing, sneak, sprint, hurt, item,
 					pose, swimming, fallFlying, pEquip, ents));
 			}
+
+			// Terrain
+			int chunkCount = in.readInt();
+			if (chunkCount < 0 || chunkCount > 200000) {
+				throw new IOException("Corrupt replay file");
+			}
+			Map<Long, TerrainChunk> loadedMap = new LinkedHashMap<>();
+			for (int i = 0; i < chunkCount; i++) {
+				int cx = in.readInt();
+				int cz = in.readInt();
+				int yStart = in.readInt();
+				int layers = in.readInt();
+				int rleLen = in.readInt();
+				if (rleLen < 0 || rleLen > 40000) {
+					throw new IOException("Corrupt replay file");
+				}
+				int[] rle = new int[rleLen];
+				for (int j = 0; j < rleLen; j++) {
+					rle[j] = in.readInt();
+				}
+				loadedMap.put(chunkKey(cx, cz), new TerrainChunk(cx, cz, yStart, layers, rle));
+			}
+
 			frames = loaded;
+			loadedTerrain = loadedMap;
+		} catch (ZipException ex) {
+			throw new IOException("This is an old file format, please record a new one");
 		}
 	}
 }
