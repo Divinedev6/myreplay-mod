@@ -15,9 +15,12 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.RegistryFriendlyByteBuf;
-import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
 import net.minecraft.network.syncher.SynchedEntityData;
@@ -34,9 +37,6 @@ import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
-import net.minecraft.world.level.ChunkPos;
-import net.minecraft.world.level.chunk.LevelChunkSection;
-import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.world.phys.Vec3;
 import org.lwjgl.glfw.GLFW;
 
@@ -125,9 +125,16 @@ public class ExampleModClient implements ClientModInitializer {
 
 	// Position of the previous replay frame
 	private static double prevFrameX, prevFrameY, prevFrameZ;
-	// Step 2: terrain replay
+
+	// Step 2: saved terrain shown during replay
 	private static boolean terrainApplied = false;
+	private static boolean terrainRadiusRaised = false;
+	private static int terrainAdded = 0;
+	private static final List<TerrainChunk> terrainPending = new ArrayList<>();
 	private static final List<Long> addedChunks = new ArrayList<>();
+	// New chunks added per tick (so the game doesn't freeze) and the biggest chunk area
+	private static final int TERRAIN_SHOW_PER_TICK = 6;
+	private static final int TERRAIN_MAX_RADIUS = 64;
 
 	// Replay helpers for the mixins
 	private static boolean animBypass = false;
@@ -207,9 +214,19 @@ public class ExampleModClient implements ClientModInitializer {
 				ghosts.clear();
 				ghostEntityIds.clear();
 				shadow.clear();
+				terrainApplied = false;
+				terrainRadiusRaised = false;
+				terrainPending.clear();
+				addedChunks.clear();
 				handSaved = false;
 				savedHand = ItemStack.EMPTY;
 				return;
+			}
+
+			// Replay stopped: take the replay terrain away again
+			if (!playing && terrainApplied) {
+				removeTerrain(level);
+				terrainApplied = false;
 			}
 
 			// Replay stopped: restore position, held item and armor
@@ -250,9 +267,11 @@ public class ExampleModClient implements ClientModInitializer {
 
 			if (playing) {
 				if (!terrainApplied) {
-					applyTerrain(level);
+					startTerrain(level, p);
 					terrainApplied = true;
 				}
+				showTerrain(level, p);
+
 				if (!handSaved) {
 					savedHand = p.getMainHandItem().copy();
 					for (int i = 0; i < SLOTS.length; i++) {
@@ -268,8 +287,6 @@ public class ExampleModClient implements ClientModInitializer {
 				if (playIndex >= frames.size()) {
 					playing = false;
 					clearGhosts();
-					removeTerrain(level);
-					terrainApplied = false;
 					restorePlayerState(p);
 					say(p, "Replay finished.");
 					return;
@@ -453,6 +470,140 @@ public class ExampleModClient implements ClientModInitializer {
 			buf[n++] = run;
 		}
 		return new TerrainChunk(cx, cz, yStart, layers, Arrays.copyOf(buf, n));
+	}
+
+	// ---------------------------------------------------------------
+	// Terrain in replay (step 2)
+	// ---------------------------------------------------------------
+
+	// Finds the saved chunks that are missing in the real world, and makes the
+	// client's chunk area big enough for them (the game ignores chunks that are
+	// outside its chunk area)
+	private static void startTerrain(ClientLevel level, LocalPlayer p) {
+		terrainPending.clear();
+		addedChunks.clear();
+		terrainAdded = 0;
+		terrainRadiusRaised = false;
+
+		if (frames.isEmpty()) return;
+		if (loadedTerrain.isEmpty()) {
+			say(p, "This replay has no saved terrain.");
+			return;
+		}
+
+		int centerX = p.getBlockX() >> 4;
+		int centerZ = p.getBlockZ() >> 4;
+		int far = 0;
+		for (TerrainChunk t : loadedTerrain.values()) {
+			if (level.hasChunk(t.cx(), t.cz())) continue; // the real chunk is already there
+			int dist = Math.max(Math.abs(t.cx() - centerX), Math.abs(t.cz() - centerZ));
+			if (dist > TERRAIN_MAX_RADIUS) continue;
+			terrainPending.add(t);
+			far = Math.max(far, dist);
+		}
+
+		if (terrainPending.isEmpty()) {
+			say(p, "All saved chunks are already loaded, nothing to add.");
+			return;
+		}
+
+		// The chunks nearest to where the replay starts come first
+		final int startX = Mth.floor(frames.get(0).x()) >> 4;
+		final int startZ = Mth.floor(frames.get(0).z()) >> 4;
+		terrainPending.sort((a, b) -> Integer.compare(
+			Math.max(Math.abs(a.cx() - startX), Math.abs(a.cz() - startZ)),
+			Math.max(Math.abs(b.cx() - startX), Math.abs(b.cz() - startZ))));
+
+		int rd = Minecraft.getInstance().options.renderDistance().get();
+		if (far + 1 > rd) {
+			level.getChunkSource().updateViewRadius(far + 1);
+			terrainRadiusRaised = true;
+		}
+		say(p, "Adding " + terrainPending.size() + " chunks of terrain...");
+	}
+
+	// Adds a few missing chunks per tick
+	private static void showTerrain(ClientLevel level, LocalPlayer p) {
+		if (terrainPending.isEmpty()) return;
+
+		PalettedContainerFactory factory = PalettedContainerFactory.create(level.registryAccess());
+		int minSection = level.dimensionType().minY() >> 4;
+		int sectionCount = level.dimensionType().height() >> 4;
+
+		for (int n = 0; n < TERRAIN_SHOW_PER_TICK && !terrainPending.isEmpty(); n++) {
+			TerrainChunk t = terrainPending.remove(0);
+			if (level.hasChunk(t.cx(), t.cz())) continue;
+			addTerrainChunk(level, factory, t, minSection, sectionCount);
+		}
+
+		if (terrainPending.isEmpty()) {
+			say(p, "Terrain shown: " + terrainAdded + " chunks");
+		}
+	}
+
+	// Builds one chunk from the saved blocks and gives it to the game
+	private static void addTerrainChunk(ClientLevel level, PalettedContainerFactory factory,
+										TerrainChunk t, int minSection, int sectionCount) {
+		try {
+			int[] ids = decodeTerrain(t);
+			FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+
+			for (int s = 0; s < sectionCount; s++) {
+				int sectionY = minSection + s;
+				LevelChunkSection section = new LevelChunkSection(factory);
+				for (int ly = 0; ly < 16; ly++) {
+					int layer = ((sectionY << 4) + ly) - t.yStart();
+					if (layer < 0 || layer >= t.layers()) continue; // outside the saved range: stays air
+					for (int z = 0; z < 16; z++) {
+						for (int x = 0; x < 16; x++) {
+							int id = ids[(layer * 16 + z) * 16 + x];
+							if (id != 0) {
+								section.setBlockState(x, ly, z, Block.stateById(id), false);
+							}
+						}
+					}
+				}
+				section.write(buf);
+			}
+
+			var chunk = level.getChunkSource().replaceWithPacketData(
+				t.cx(), t.cz(), buf, new HashMap<>(), output -> {});
+			if (chunk != null) {
+				addedChunks.add(chunkKey(t.cx(), t.cz()));
+				terrainAdded++;
+			}
+		} catch (Exception ex) {
+			// skip this chunk
+		}
+	}
+
+	// Turns the saved (block id, run length) pairs back into one id per block
+	private static int[] decodeTerrain(TerrainChunk t) {
+		int[] out = new int[t.layers() * 256];
+		int pos = 0;
+		for (int i = 0; i + 1 < t.rle().length; i += 2) {
+			int id = t.rle()[i];
+			int run = t.rle()[i + 1];
+			for (int k = 0; k < run && pos < out.length; k++) {
+				out[pos++] = id;
+			}
+		}
+		return out;
+	}
+
+	// Removes only the chunks we added, so the real world stays as it was
+	private static void removeTerrain(ClientLevel level) {
+		terrainPending.clear();
+		for (long key : addedChunks) {
+			int cx = (int) (key >> 32);
+			int cz = (int) key;
+			level.getChunkSource().drop(new ChunkPos(cx, cz));
+		}
+		addedChunks.clear();
+		if (terrainRadiusRaised) {
+			level.getChunkSource().updateViewRadius(Minecraft.getInstance().options.renderDistance().get());
+			terrainRadiusRaised = false;
+		}
 	}
 
 	// Only these poses are replayed on the player; others fall back to standing
@@ -746,7 +897,6 @@ public class ExampleModClient implements ClientModInitializer {
 							recording = false;
 							clearGhosts();
 							playIndex = 0;
-							terrainApplied = false;
 							playing = true;
 							ctx.getSource().sendFeedback(Component.literal("Playing replay: " + name));
 						} catch (IOException e) {
@@ -964,70 +1114,5 @@ public class ExampleModClient implements ClientModInitializer {
 		} catch (ZipException ex) {
 			throw new IOException("This is an old file format, please record a new one");
 		}
-	}
-
-	// --- Step 2: show saved terrain during replay ---
-
-	private static void applyTerrain(ClientLevel level) {
-		if (loadedTerrain.isEmpty()) return;
-		int minSection = level.getMinSectionY();
-		int maxSection = level.getMaxSectionY();
-		int added = 0;
-
-		for (TerrainChunk t : loadedTerrain.values()) {
-			// A real chunk is already loaded here, don't touch it
-			if (level.hasChunk(t.cx(), t.cz())) continue;
-
-			int[] ids = decodeTerrain(t);
-			FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
-			for (int sy = minSection; sy < maxSection; sy++) {
-				LevelChunkSection section = new LevelChunkSection(PalettedContainerFactory.create(level.registryAccess()));
-				for (int ly = 0; ly < 16; ly++) {
-					int idx = ((sy << 4) + ly) - t.yStart();
-					if (idx < 0 || idx >= t.layers()) continue; // outside saved range
-					for (int z = 0; z < 16; z++) {
-						for (int x = 0; x < 16; x++) {
-							int id = ids[(idx * 16 + z) * 16 + x];
-							if (id != 0) {
-								section.setBlockState(x, ly, z, Block.stateById(id));
-							}
-						}
-					}
-				}
-				section.write(buf);
-			}
-			level.getChunkSource().replaceWithPacketData(t.cx(), t.cz(), buf, Map.of(), info -> {});
-			addedChunks.add(chunkKey(t.cx(), t.cz()));
-			added++;
-		}
-
-		LocalPlayer p = Minecraft.getInstance().player;
-		if (p != null) {
-			say(p, "Terrain shown: " + added + " chunks");
-		}
-	}
-
-	// Turns the saved (block id, run length) pairs back into one id array
-	private static int[] decodeTerrain(TerrainChunk t) {
-		int[] out = new int[t.layers() * 256];
-		int pos = 0;
-		for (int i = 0; i + 1 < t.rle().length; i += 2) {
-			int id = t.rle()[i];
-			int run = t.rle()[i + 1];
-			for (int k = 0; k < run && pos < out.length; k++) {
-				out[pos++] = id;
-			}
-		}
-		return out;
-	}
-
-	// Removes only the chunks we added, so the real world stays intact
-	private static void removeTerrain(ClientLevel level) {
-		for (long key : addedChunks) {
-			int cx = (int) (key >> 32);
-			int cz = (int) key;
-			level.getChunkSource().drop(new ChunkPos(cx, cz));
-		}
-		addedChunks.clear();
 	}
 }
