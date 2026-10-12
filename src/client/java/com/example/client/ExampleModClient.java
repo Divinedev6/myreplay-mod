@@ -282,6 +282,9 @@ public class ExampleModClient implements ClientModInitializer {
 					savedZ = p.getZ();
 					savedYaw = p.getYRot();
 					savedPitch = p.getXRot();
+					say(p, "[debug] your real position: " + (int) savedX + " " + (int) savedY + " " + (int) savedZ
+						+ " | replay starts at " + (int) frames.get(0).x() + " " + (int) frames.get(0).y()
+						+ " " + (int) frames.get(0).z());
 					handSaved = true;
 				}
 				if (playIndex >= frames.size()) {
@@ -494,16 +497,33 @@ public class ExampleModClient implements ClientModInitializer {
 		int centerX = p.getBlockX() >> 4;
 		int centerZ = p.getBlockZ() >> 4;
 		int far = 0;
+		int alreadyLoaded = 0;
+		int tooFar = 0;
+		int nearest = Integer.MAX_VALUE;
 		for (TerrainChunk t : loadedTerrain.values()) {
-			if (level.hasChunk(t.cx(), t.cz())) continue; // the real chunk is already there
 			int dist = Math.max(Math.abs(t.cx() - centerX), Math.abs(t.cz() - centerZ));
-			if (dist > TERRAIN_MAX_RADIUS) continue;
+			nearest = Math.min(nearest, dist);
+			if (level.hasChunk(t.cx(), t.cz())) { // the real chunk is already there
+				alreadyLoaded++;
+				continue;
+			}
+			if (dist > TERRAIN_MAX_RADIUS) {
+				tooFar++;
+				continue;
+			}
 			terrainPending.add(t);
 			far = Math.max(far, dist);
 		}
 
+		// Debug line (will be removed later)
+		say(p, "[debug] you are in chunk " + centerX + "," + centerZ
+			+ " | saved " + loadedTerrain.size()
+			+ ", already loaded " + alreadyLoaded
+			+ ", too far " + tooFar
+			+ ", to add " + terrainPending.size()
+			+ ", nearest saved chunk is " + nearest + " chunks away");
+
 		if (terrainPending.isEmpty()) {
-			say(p, "All saved chunks are already loaded, nothing to add.");
 			return;
 		}
 
@@ -751,6 +771,7 @@ public class ExampleModClient implements ClientModInitializer {
 				}
 			}
 			p.setPos(savedX, savedY, savedZ);
+			say(p, "[debug] put back at " + (int) savedX + " " + (int) savedY + " " + (int) savedZ);
 			p.setYRot(savedYaw);
 			p.setXRot(savedPitch);
 			p.setDeltaMovement(Vec3.ZERO);
