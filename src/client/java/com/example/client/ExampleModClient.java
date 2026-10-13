@@ -19,6 +19,7 @@ import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.PalettedContainerFactory;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.chat.Component;
@@ -402,6 +403,12 @@ public class ExampleModClient implements ClientModInitializer {
 	// Terrain saving (step 1: only saves, the replay doesn't use it yet)
 	// ---------------------------------------------------------------
 
+	// Is this chunk really loaded in the client right now?
+	// (level.hasChunk() is not reliable here: it said yes for far away chunks)
+	private static boolean isChunkLoaded(ClientLevel level, int cx, int cz) {
+		return level.getChunkSource().getChunk(cx, cz, ChunkStatus.FULL, false) != null;
+	}
+
 	private static long chunkKey(int cx, int cz) {
 		return (((long) cx) << 32) ^ (cz & 0xFFFFFFFFL);
 	}
@@ -425,7 +432,7 @@ public class ExampleModClient implements ClientModInitializer {
 					int cz = pcz + dz;
 					long key = chunkKey(cx, cz);
 					if (terrain.containsKey(key)) continue;
-					if (!level.hasChunk(cx, cz)) continue;
+					if (!isChunkLoaded(level, cx, cz)) continue;
 					terrain.put(key, readChunk(level, cx, cz, yStart, layers));
 					budget--;
 				}
@@ -503,7 +510,7 @@ public class ExampleModClient implements ClientModInitializer {
 		for (TerrainChunk t : loadedTerrain.values()) {
 			int dist = Math.max(Math.abs(t.cx() - centerX), Math.abs(t.cz() - centerZ));
 			nearest = Math.min(nearest, dist);
-			if (level.hasChunk(t.cx(), t.cz())) { // the real chunk is already there
+			if (isChunkLoaded(level, t.cx(), t.cz())) { // the real chunk is already there
 				alreadyLoaded++;
 				continue;
 			}
@@ -552,7 +559,7 @@ public class ExampleModClient implements ClientModInitializer {
 
 		for (int n = 0; n < TERRAIN_SHOW_PER_TICK && !terrainPending.isEmpty(); n++) {
 			TerrainChunk t = terrainPending.remove(0);
-			if (level.hasChunk(t.cx(), t.cz())) continue;
+			if (isChunkLoaded(level, t.cx(), t.cz())) continue;
 			addTerrainChunk(level, factory, t, minSection, sectionCount);
 		}
 
