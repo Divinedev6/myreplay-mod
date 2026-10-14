@@ -17,6 +17,9 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.client.multiplayer.ClientPacketListener;
+import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
@@ -553,14 +556,12 @@ public class ExampleModClient implements ClientModInitializer {
 	private static void showTerrain(ClientLevel level, LocalPlayer p) {
 		if (terrainPending.isEmpty()) return;
 
-		PalettedContainerFactory factory = PalettedContainerFactory.create(level.registryAccess());
 		int minSection = level.dimensionType().minY() >> 4;
-		int sectionCount = level.dimensionType().height() >> 4;
 
 		for (int n = 0; n < TERRAIN_SHOW_PER_TICK && !terrainPending.isEmpty(); n++) {
 			TerrainChunk t = terrainPending.remove(0);
 			if (isChunkLoaded(level, t.cx(), t.cz())) continue;
-			addTerrainChunk(level, factory, t, minSection, sectionCount);
+			addTerrainChunk(level, t, minSection);
 		}
 
 		if (terrainPending.isEmpty()) {
@@ -568,16 +569,18 @@ public class ExampleModClient implements ClientModInitializer {
 		}
 	}
 
-	// Builds one chunk from the saved blocks and gives it to the game
-	private static void addTerrainChunk(ClientLevel level, PalettedContainerFactory factory,
-										TerrainChunk t, int minSection, int sectionCount) {
+	// Builds one chunk from the saved blocks and gives it to the game the same way
+	// the server does (chunk + light packet). That way the game sets up the light and
+	// render mods like Sodium know about the chunk, so it is really drawn.
+	private static void addTerrainChunk(ClientLevel level, TerrainChunk t, int minSection) {
 		try {
 			int[] ids = decodeTerrain(t);
-			FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+			LevelChunk chunk = new LevelChunk(level, new ChunkPos(t.cx(), t.cz()));
+			int sectionCount = chunk.getSections().length;
 
 			for (int s = 0; s < sectionCount; s++) {
 				int sectionY = minSection + s;
-				LevelChunkSection section = new LevelChunkSection(factory);
+				LevelChunkSection section = chunk.getSection(s);
 				for (int ly = 0; ly < 16; ly++) {
 					int layer = ((sectionY << 4) + ly) - t.yStart();
 					if (layer < 0 || layer >= t.layers()) continue; // outside the saved range: stays air
@@ -590,12 +593,14 @@ public class ExampleModClient implements ClientModInitializer {
 						}
 					}
 				}
-				section.write(buf);
 			}
 
-			var chunk = level.getChunkSource().replaceWithPacketData(
-				t.cx(), t.cz(), buf, new HashMap<>(), output -> {});
-			if (chunk != null) {
+			ClientPacketListener connection = Minecraft.getInstance().getConnection();
+			if (connection == null) return;
+			new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null)
+				.handle(connection);
+
+			if (isChunkLoaded(level, t.cx(), t.cz())) {
 				addedChunks.add(chunkKey(t.cx(), t.cz()));
 				terrainAdded++;
 			}
