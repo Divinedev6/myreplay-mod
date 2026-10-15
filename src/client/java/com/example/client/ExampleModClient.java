@@ -20,6 +20,9 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.core.SectionPos;
+import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
@@ -599,6 +602,15 @@ public class ExampleModClient implements ClientModInitializer {
 			if (connection == null) return;
 			new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null)
 				.handle(connection);
+
+			// The saved terrain has no light data, so give every section full sky light
+			// (otherwise the whole terrain is drawn almost black)
+			byte[] full = new byte[2048];
+			Arrays.fill(full, (byte) 0xFF);
+			for (int s = 0; s < sectionCount; s++) {
+				level.getLightEngine().queueSectionData(LightLayer.SKY,
+					SectionPos.of(t.cx(), minSection + s, t.cz()), new DataLayer(full.clone()));
+			}
 
 			if (isChunkLoaded(level, t.cx(), t.cz())) {
 				addedChunks.add(chunkKey(t.cx(), t.cz()));
