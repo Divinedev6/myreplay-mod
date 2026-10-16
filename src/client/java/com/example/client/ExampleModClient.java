@@ -145,6 +145,15 @@ public class ExampleModClient implements ClientModInitializer {
 	// Light of the replay terrain, calculated in the background (null = not ready yet)
 	private static volatile Map<Long, LightChunk> terrainLight = null;
 	private static volatile int terrainLightGen = 0;
+	// Chunks whose light is given to the game a second time a bit later (and their
+	// sections redrawn). Each entry = {chunk key, tick when it is due}
+	private static final List<long[]> lightRefresh = new ArrayList<>();
+	private static int refreshTick = 0;
+	private static final int REFRESH_DELAY_TICKS = 20;
+	private static final int REFRESH_PER_TICK = 6;
+	private static int refreshChunks = 0;
+	private static int refreshMissing = 0;
+	private static int refreshChanged = 0;
 
 	// Replay helpers for the mixins
 	private static boolean animBypass = false;
@@ -228,6 +237,7 @@ public class ExampleModClient implements ClientModInitializer {
 				terrainRadiusRaised = false;
 				terrainPending.clear();
 				addedChunks.clear();
+				lightRefresh.clear();
 				handSaved = false;
 				savedHand = ItemStack.EMPTY;
 				return;
@@ -281,6 +291,7 @@ public class ExampleModClient implements ClientModInitializer {
 					terrainApplied = true;
 				}
 				showTerrain(level, p);
+				refreshLight(level, p);
 
 				if (!handSaved) {
 					savedHand = p.getMainHandItem().copy();
@@ -501,6 +512,10 @@ public class ExampleModClient implements ClientModInitializer {
 	private static void startTerrain(ClientLevel level, LocalPlayer p) {
 		terrainPending.clear();
 		addedChunks.clear();
+		lightRefresh.clear();
+		refreshChunks = 0;
+		refreshMissing = 0;
+		refreshChanged = 0;
 		terrainAdded = 0;
 		terrainRadiusRaised = false;
 
@@ -641,10 +656,70 @@ public class ExampleModClient implements ClientModInitializer {
 
 			if (isChunkLoaded(level, t.cx(), t.cz())) {
 				addedChunks.add(chunkKey(t.cx(), t.cz()));
+				lightRefresh.add(new long[] {chunkKey(t.cx(), t.cz()), refreshTick + REFRESH_DELAY_TICKS});
 				terrainAdded++;
 			}
 		} catch (Exception ex) {
 			// skip this chunk
+		}
+	}
+
+	// A little while after a chunk was added, its light is given to the game again and
+	// the chunk's sections are redrawn. The first light data can get lost or arrive
+	// after the chunk was already drawn; the game then keeps the dark picture forever.
+	// It also counts how many sections the game was missing or had different light,
+	// and prints that once at the end (so we can see if this was the problem).
+	private static void refreshLight(ClientLevel level, LocalPlayer p) {
+		refreshTick++;
+		if (lightRefresh.isEmpty()) return;
+		Map<Long, LightChunk> lightMap = terrainLight;
+		if (lightMap == null) return;
+
+		int minSection = level.dimensionType().minY() >> 4;
+		int sectionCount = level.getSectionsCount();
+
+		for (int n = 0; n < REFRESH_PER_TICK && !lightRefresh.isEmpty(); n++) {
+			long[] entry = lightRefresh.get(0);
+			if (entry[1] > refreshTick) break; // not due yet (the list is in order)
+			lightRefresh.remove(0);
+
+			long key = entry[0];
+			int cx = (int) (key >> 32);
+			int cz = (int) key;
+			LightChunk lc = lightMap.get(key);
+			if (lc == null || !isChunkLoaded(level, cx, cz)) continue;
+			TerrainChunk t = lc.t;
+			refreshChunks++;
+
+			for (int s = 0; s < sectionCount; s++) {
+				int sectionY = minSection + s;
+				SectionPos sp = SectionPos.of(cx, sectionY, cz);
+				for (int k = 0; k < 2; k++) {
+					boolean sky = (k == 0);
+					LightLayer layerType = sky ? LightLayer.SKY : LightLayer.BLOCK;
+					DataLayer ours = buildLightLayer(lc, t, sectionY, sky);
+					DataLayer current = level.getLightEngine().getLayerListener(layerType).getDataLayerData(sp);
+					if (current == null) {
+						refreshMissing++;
+					} else if (!Arrays.equals(current.getData(), ours.getData())) {
+						refreshChanged++;
+					}
+					level.getLightEngine().queueSectionData(layerType, sp, ours);
+				}
+				// redraw only the sections that hold saved blocks
+				int from = (sectionY << 4) - t.yStart();
+				if (from < t.layers() && from + 16 > 0) {
+					level.setSectionDirtyWithNeighbors(cx, sectionY, cz);
+				}
+			}
+		}
+
+		if (lightRefresh.isEmpty() && refreshChunks > 0) {
+			say(p, "[debug] light check: " + refreshChunks + " chunks, sections the game had no light for: "
+				+ refreshMissing + ", with different light: " + refreshChanged + " (light given again)");
+			refreshChunks = 0;
+			refreshMissing = 0;
+			refreshChanged = 0;
 		}
 	}
 
@@ -939,6 +1014,7 @@ public class ExampleModClient implements ClientModInitializer {
 	// Removes only the chunks we added, so the real world stays as it was
 	private static void removeTerrain(ClientLevel level) {
 		terrainPending.clear();
+		lightRefresh.clear();
 		terrainLight = null;
 		terrainLightGen++;
 		for (long key : addedChunks) {
