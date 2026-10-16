@@ -142,6 +142,9 @@ public class ExampleModClient implements ClientModInitializer {
 	// New chunks added per tick (so the game doesn't freeze) and the biggest chunk area
 	private static final int TERRAIN_SHOW_PER_TICK = 6;
 	private static final int TERRAIN_MAX_RADIUS = 64;
+	// Light of the replay terrain, calculated in the background (null = not ready yet)
+	private static volatile Map<Long, LightChunk> terrainLight = null;
+	private static volatile int terrainLightGen = 0;
 
 	// Replay helpers for the mixins
 	private static boolean animBypass = false;
@@ -552,12 +555,32 @@ public class ExampleModClient implements ClientModInitializer {
 			level.getChunkSource().updateViewRadius(far + 1);
 			terrainRadiusRaised = true;
 		}
-		say(p, "Adding " + terrainPending.size() + " chunks of terrain...");
+
+		// Calculate the light of all these chunks in the background
+		terrainLight = null;
+		final int gen = ++terrainLightGen;
+		final List<TerrainChunk> forLight = new ArrayList<>(terrainPending);
+		Thread lightThread = new Thread(() -> {
+			Map<Long, LightChunk> result;
+			try {
+				result = computeLight(forLight);
+			} catch (Throwable ex) {
+				result = new HashMap<>(); // no light data: the terrain gets plain full sky light
+			}
+			if (gen == terrainLightGen) {
+				terrainLight = result;
+			}
+		}, "rw-terrain-light");
+		lightThread.setDaemon(true);
+		lightThread.start();
+
+		say(p, "Adding " + terrainPending.size() + " chunks of terrain (calculating light first)...");
 	}
 
 	// Adds a few missing chunks per tick
 	private static void showTerrain(ClientLevel level, LocalPlayer p) {
 		if (terrainPending.isEmpty()) return;
+		if (terrainLight == null) return; // still calculating the light
 
 		int minSection = level.dimensionType().minY() >> 4;
 
@@ -603,13 +626,17 @@ public class ExampleModClient implements ClientModInitializer {
 			new ClientboundLevelChunkWithLightPacket(chunk, level.getLightEngine(), null, null)
 				.handle(connection);
 
-			// The saved terrain has no light data, so give every section full sky light
-			// (otherwise the whole terrain is drawn almost black)
-			byte[] full = new byte[2048];
-			Arrays.fill(full, (byte) 0xFF);
+			// The saved terrain has no light data, so the light was calculated by the mod
+			// (see LightCalc). It is handed to the light engine like a server would do it.
+			Map<Long, LightChunk> lightMap = terrainLight;
+			LightChunk lc = (lightMap == null) ? null : lightMap.get(chunkKey(t.cx(), t.cz()));
 			for (int s = 0; s < sectionCount; s++) {
-				level.getLightEngine().queueSectionData(LightLayer.SKY,
-					SectionPos.of(t.cx(), minSection + s, t.cz()), new DataLayer(full.clone()));
+				int sectionY = minSection + s;
+				SectionPos sp = SectionPos.of(t.cx(), sectionY, t.cz());
+				level.getLightEngine().queueSectionData(LightLayer.SKY, sp,
+					buildLightLayer(lc, t, sectionY, true));
+				level.getLightEngine().queueSectionData(LightLayer.BLOCK, sp,
+					buildLightLayer(lc, t, sectionY, false));
 			}
 
 			if (isChunkLoaded(level, t.cx(), t.cz())) {
@@ -618,6 +645,280 @@ public class ExampleModClient implements ClientModInitializer {
 			}
 		} catch (Exception ex) {
 			// skip this chunk
+		}
+	}
+
+	// ---------------------------------------------------------------
+	// Light of the replay terrain (calculated by the mod, because the saved
+	// terrain has no light data)
+	// ---------------------------------------------------------------
+
+	private static final int[] DX = {1, -1, 0, 0, 0, 0};
+	private static final int[] DY = {0, 0, 0, 0, 1, -1};
+	private static final int[] DZ = {0, 0, 1, -1, 0, 0};
+
+	// Block ids and the calculated light levels (0 to 15) of one saved chunk.
+	// Cell index = (layer * 16 + z) * 16 + x
+	private static final class LightChunk {
+		final TerrainChunk t;
+		final int[] ids;
+		final byte[] sky;
+		final byte[] block;
+
+		LightChunk(TerrainChunk t, int[] ids) {
+			this.t = t;
+			this.ids = ids;
+			this.sky = new byte[ids.length];
+			this.block = new byte[ids.length];
+		}
+	}
+
+	private static Map<Long, LightChunk> computeLight(List<TerrainChunk> list) {
+		Map<Long, LightChunk> map = new HashMap<>();
+		for (TerrainChunk t : list) {
+			map.put(chunkKey(t.cx(), t.cz()), new LightChunk(t, decodeTerrain(t)));
+		}
+		new LightCalc(map).run();
+		return map;
+	}
+
+	// Turns the light levels of one chunk section into a light layer for the game
+	private static DataLayer buildLightLayer(LightChunk lc, TerrainChunk t, int sectionY, boolean sky) {
+		byte[] data = new byte[2048];
+		for (int ly = 0; ly < 16; ly++) {
+			int layer = ((sectionY << 4) + ly) - t.yStart();
+			for (int z = 0; z < 16; z++) {
+				for (int x = 0; x < 16; x++) {
+					int value;
+					if (lc != null && layer >= 0 && layer < t.layers()) {
+						value = (sky ? lc.sky : lc.block)[(layer * 16 + z) * 16 + x];
+					} else if (sky) {
+						// above the saved part (or no calculation): open sky
+						value = (lc == null || layer >= t.layers()) ? 15 : 0;
+					} else {
+						value = 0;
+					}
+					int index = (ly << 8) | (z << 4) | x;
+					int byteIndex = index >> 1;
+					if ((index & 1) == 0) {
+						data[byteIndex] = (byte) ((data[byteIndex] & 0xF0) | (value & 15));
+					} else {
+						data[byteIndex] = (byte) ((data[byteIndex] & 0x0F) | ((value & 15) << 4));
+					}
+				}
+			}
+		}
+		return new DataLayer(data);
+	}
+
+	// Calculates sky light and block light for all saved chunks, with the same
+	// rules as the game: light goes down from the sky, spreads to the sides and
+	// gets weaker by 1 per block (more through leaves, water, etc.)
+	private static final class LightCalc {
+		private final Map<Long, LightChunk> chunks;
+		private final short[] opacityCache = new short[65536]; // opacity + 1, 0 = not known yet
+		private final short[] emissionCache = new short[65536]; // emission + 1, 0 = not known yet
+		private long[] queue = new long[1 << 16];
+		private int head;
+		private int tail;
+		private long lastKey = Long.MIN_VALUE;
+		private LightChunk lastChunk;
+
+		LightCalc(Map<Long, LightChunk> chunks) {
+			this.chunks = chunks;
+		}
+
+		void run() {
+			skyDown();
+			skyStart();
+			spread(true);
+			blockStart();
+			spread(false);
+		}
+
+		private LightChunk chunkAt(int cx, int cz) {
+			long key = chunkKey(cx, cz);
+			if (key != lastKey) {
+				lastKey = key;
+				lastChunk = chunks.get(key);
+			}
+			return lastChunk;
+		}
+
+		private int opacity(int id) {
+			if (id < 0 || id >= opacityCache.length) {
+				return Block.stateById(id).getLightBlock();
+			}
+			int v = opacityCache[id];
+			if (v == 0) {
+				v = Block.stateById(id).getLightBlock() + 1;
+				opacityCache[id] = (short) v;
+			}
+			return v - 1;
+		}
+
+		private int emission(int id) {
+			if (id < 0 || id >= emissionCache.length) {
+				return Block.stateById(id).getLightEmission();
+			}
+			int v = emissionCache[id];
+			if (v == 0) {
+				v = Block.stateById(id).getLightEmission() + 1;
+				emissionCache[id] = (short) v;
+			}
+			return v - 1;
+		}
+
+		// Index of a cell inside a chunk, or -1 if it is outside the saved layers
+		private int cellIndex(LightChunk c, int y, int wx, int wz) {
+			int ly = y - c.t.yStart();
+			if (ly < 0 || ly >= c.t.layers()) return -1;
+			return (ly * 16 + (wz & 15)) * 16 + (wx & 15);
+		}
+
+		// Sky light straight down from the top of the saved part
+		private void skyDown() {
+			for (LightChunk c : chunks.values()) {
+				int layers = c.t.layers();
+				for (int z = 0; z < 16; z++) {
+					for (int x = 0; x < 16; x++) {
+						int cur = 15;
+						for (int ly = layers - 1; ly >= 0; ly--) {
+							int idx = (ly * 16 + z) * 16 + x;
+							int op = opacity(c.ids[idx]);
+							if (op >= 15) {
+								cur = 0;
+							} else if (op > 0) {
+								cur = Math.max(0, cur - op);
+							}
+							c.sky[idx] = (byte) cur;
+						}
+					}
+				}
+			}
+		}
+
+		// Sky-lit cells that have a darker neighbour next to them start the spreading
+		private void skyStart() {
+			head = 0;
+			tail = 0;
+			for (LightChunk c : chunks.values()) {
+				int layers = c.t.layers();
+				for (int ly = 0; ly < layers; ly++) {
+					int y = c.t.yStart() + ly;
+					for (int z = 0; z < 16; z++) {
+						for (int x = 0; x < 16; x++) {
+							int idx = (ly * 16 + z) * 16 + x;
+							int level = c.sky[idx];
+							if (level <= 1) continue;
+							int wx = (c.t.cx() << 4) + x;
+							int wz = (c.t.cz() << 4) + z;
+							for (int d = 0; d < 4; d++) {
+								int nx = wx + DX[d];
+								int nz = wz + DZ[d];
+								LightChunk nc = chunkAt(nx >> 4, nz >> 4);
+								if (nc == null) continue;
+								int ni = cellIndex(nc, y, nx, nz);
+								if (ni < 0) continue;
+								if (opacity(nc.ids[ni]) >= 15) continue;
+								if (nc.sky[ni] < level - 1) {
+									push(wx, y, wz);
+									break;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Every light-emitting block (torch, lantern, glowstone...) starts the spreading
+		private void blockStart() {
+			head = 0;
+			tail = 0;
+			for (LightChunk c : chunks.values()) {
+				int layers = c.t.layers();
+				for (int ly = 0; ly < layers; ly++) {
+					int y = c.t.yStart() + ly;
+					for (int z = 0; z < 16; z++) {
+						for (int x = 0; x < 16; x++) {
+							int idx = (ly * 16 + z) * 16 + x;
+							int id = c.ids[idx];
+							if (id == 0) continue;
+							int em = emission(id);
+							if (em > 0) {
+								c.block[idx] = (byte) em;
+								push((c.t.cx() << 4) + x, y, (c.t.cz() << 4) + z);
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Spreads the light from the queued cells to their neighbours
+		private void spread(boolean sky) {
+			while (head < tail) {
+				long v = queue[head++];
+				int x = unpackX(v);
+				int y = unpackY(v);
+				int z = unpackZ(v);
+
+				LightChunk c = chunkAt(x >> 4, z >> 4);
+				if (c == null) continue;
+				int ci = cellIndex(c, y, x, z);
+				if (ci < 0) continue;
+				int level = (sky ? c.sky : c.block)[ci];
+				if (level <= 1) continue;
+
+				for (int d = 0; d < 6; d++) {
+					int nx = x + DX[d];
+					int ny = y + DY[d];
+					int nz = z + DZ[d];
+					LightChunk nc = chunkAt(nx >> 4, nz >> 4);
+					if (nc == null) continue;
+					int ni = cellIndex(nc, ny, nx, nz);
+					if (ni < 0) continue;
+
+					int op = opacity(nc.ids[ni]);
+					int newLevel;
+					if (sky && d == 5 && level == 15 && op == 0) {
+						newLevel = 15; // full sky light keeps going straight down
+					} else {
+						newLevel = level - Math.max(1, op);
+					}
+					if (newLevel <= 0) continue;
+
+					byte[] arr = sky ? nc.sky : nc.block;
+					if (newLevel > arr[ni]) {
+						arr[ni] = (byte) newLevel;
+						push(nx, ny, nz);
+					}
+				}
+			}
+		}
+
+		private void push(int x, int y, int z) {
+			if (tail == queue.length) {
+				queue = Arrays.copyOf(queue, queue.length * 2);
+			}
+			queue[tail++] = ((long) (x & 0x3FFFFFF) << 38)
+				| ((long) (z & 0x3FFFFFF) << 12)
+				| (long) ((y + 2048) & 0xFFF);
+		}
+
+		private static int unpackX(long v) {
+			int x = (int) (v >> 38);
+			return (x << 6) >> 6;
+		}
+
+		private static int unpackZ(long v) {
+			int z = (int) ((v >> 12) & 0x3FFFFFF);
+			return (z << 6) >> 6;
+		}
+
+		private static int unpackY(long v) {
+			return (int) (v & 0xFFF) - 2048;
 		}
 	}
 
@@ -638,6 +939,8 @@ public class ExampleModClient implements ClientModInitializer {
 	// Removes only the chunks we added, so the real world stays as it was
 	private static void removeTerrain(ClientLevel level) {
 		terrainPending.clear();
+		terrainLight = null;
+		terrainLightGen++;
 		for (long key : addedChunks) {
 			int cx = (int) (key >> 32);
 			int cz = (int) key;
