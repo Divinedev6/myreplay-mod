@@ -44,6 +44,7 @@ import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 import org.lwjgl.glfw.GLFW;
 
@@ -70,7 +71,8 @@ import java.util.zip.GZIPOutputStream;
 import java.util.zip.ZipException;
 
 public class ExampleModClient implements ClientModInitializer {
-	private static final int MAGIC = 0x52570008; // file format v8 (gzip + terrain)
+	private static final int MAGIC = 0x52570009; // file format v9 (gzip + terrain + block changes)
+	private static final int MAGIC_V8 = 0x52570008; // old format (no block changes), still readable
 
 	// All equipment slots (head, chest, legs, feet, offhand, body armor, saddle...)
 	private static final EquipmentSlot[] SLOTS = EquipmentSlot.values();
@@ -100,6 +102,20 @@ public class ExampleModClient implements ClientModInitializer {
 	// One saved chunk column: blocks from yStart for "layers" layers.
 	// rle = pairs of (block state id, how many times in a row)
 	private record TerrainChunk(int cx, int cz, int yStart, int layers, int[] rle) {}
+
+	// One block change: it happens at the start of tick "tick", the block at x,y,z
+	// becomes block state "state" (a block state id, 0 = air)
+	private record BlockChange(int tick, int x, int y, int z, int state) {}
+
+	private static final int MAX_BLOCK_EVENTS = 200000;
+	private static List<BlockChange> blockEvents = new ArrayList<>(); // while recording
+	private static boolean blockLimitWarned = false;
+	private static List<BlockChange> loadedBlockEvents = new ArrayList<>(); // while replaying
+	private static int blockEventPtr = 0;
+	// Changes whose chunk isn't shown yet (the terrain is added a few chunks per tick)
+	private static final List<BlockChange> deferredBlocks = new ArrayList<>();
+	// What the replay changed in the real world: block position -> block before the change
+	private static final Map<Long, BlockState> blockOriginals = new HashMap<>();
 
 	private static List<Frame> frames = new ArrayList<>();
 	private static boolean recording = false;
@@ -188,15 +204,31 @@ public class ExampleModClient implements ClientModInitializer {
 		return replayCrouch;
 	}
 
+	// Used by the block mixin: the client world just changed a block
+	public static void onBlockChanged(BlockPos pos, BlockState newState) {
+		if (!recording || playing) return;
+		if (blockEvents.size() >= MAX_BLOCK_EVENTS) {
+			if (!blockLimitWarned) {
+				blockLimitWarned = true;
+				LocalPlayer p = Minecraft.getInstance().player;
+				if (p != null) say(p, "Too many block changes, the rest are not saved.");
+			}
+			return;
+		}
+		blockEvents.add(new BlockChange(frames.size(), pos.getX(), pos.getY(), pos.getZ(),
+			Block.getId(newState)));
+	}
+
 	// Used by the name screen
 	public static void saveFrames(String name) throws IOException {
-		save(name, frames, terrain);
+		save(name, frames, terrain, blockEvents);
 
 		// Tell how much terrain was saved (so we can check the file size)
 		LocalPlayer p = Minecraft.getInstance().player;
 		if (p != null) {
 			long kb = Files.size(dir().resolve(name + ".rw")) / 1024;
-			say(p, "Terrain: " + terrain.size() + " chunks saved, file size " + kb + " KB");
+			say(p, "Terrain: " + terrain.size() + " chunks saved, " + blockEvents.size()
+				+ " block changes, file size " + kb + " KB");
 		}
 	}
 
@@ -207,6 +239,7 @@ public class ExampleModClient implements ClientModInitializer {
 	public static void discardRecording() {
 		frames = new ArrayList<>();
 		terrain.clear();
+		blockEvents = new ArrayList<>();
 	}
 
 	@Override
@@ -238,6 +271,8 @@ public class ExampleModClient implements ClientModInitializer {
 				terrainPending.clear();
 				addedChunks.clear();
 				lightRefresh.clear();
+				deferredBlocks.clear();
+				blockOriginals.clear();
 				handSaved = false;
 				savedHand = ItemStack.EMPTY;
 				return;
@@ -245,6 +280,7 @@ public class ExampleModClient implements ClientModInitializer {
 
 			// Replay stopped: take the replay terrain away again
 			if (!playing && terrainApplied) {
+				restoreBlocks(level);
 				removeTerrain(level);
 				terrainApplied = false;
 			}
@@ -262,6 +298,8 @@ public class ExampleModClient implements ClientModInitializer {
 					clearGhosts();
 					frames = new ArrayList<>();
 					terrain.clear();
+					blockEvents = new ArrayList<>();
+					blockLimitWarned = false;
 					recording = true;
 					say(p, "Recording started! Press G again to stop.");
 				} else {
@@ -317,6 +355,7 @@ public class ExampleModClient implements ClientModInitializer {
 				}
 				int idx = playIndex;
 				Frame f = frames.get(playIndex++);
+				applyBlockChanges(level, idx);
 
 				// Position of the previous replay frame. We don't use the player's
 				// current position here, because the game moves the player a little
@@ -420,6 +459,68 @@ public class ExampleModClient implements ClientModInitializer {
 	}
 
 	// ---------------------------------------------------------------
+	// Block changes during replay (blocks broken / placed while recording)
+	// ---------------------------------------------------------------
+
+	// Plays all block changes that are due at replay tick "idx"
+	private static void applyBlockChanges(ClientLevel level, int idx) {
+		// First try the changes that had to wait for their chunk
+		if (!deferredBlocks.isEmpty()) {
+			Iterator<BlockChange> it = deferredBlocks.iterator();
+			while (it.hasNext()) {
+				BlockChange b = it.next();
+				if (setReplayBlock(level, b)) {
+					it.remove();
+				} else if (terrainPending.isEmpty()) {
+					it.remove(); // all terrain is shown and this chunk is still not there: give up
+				}
+			}
+		}
+
+		while (blockEventPtr < loadedBlockEvents.size()) {
+			BlockChange b = loadedBlockEvents.get(blockEventPtr);
+			if (b.tick() > idx) break;
+			blockEventPtr++;
+			if (!setReplayBlock(level, b) && !terrainPending.isEmpty()) {
+				deferredBlocks.add(b);
+			}
+		}
+	}
+
+	// Sets one block (false = the chunk isn't there). The block that was there before is
+	// remembered, so the real world can be put back when the replay ends.
+	private static boolean setReplayBlock(ClientLevel level, BlockChange b) {
+		if (!isChunkLoaded(level, b.x() >> 4, b.z() >> 4)) return false;
+		if (level.isOutsideBuildHeight(b.y())) return true;
+		BlockPos pos = new BlockPos(b.x(), b.y(), b.z());
+		long key = pos.asLong();
+		if (!blockOriginals.containsKey(key)) {
+			blockOriginals.put(key, level.getBlockState(pos));
+		}
+		// 18 = tell the renderer, but don't update the neighbours (the recording
+		// already has their changes as separate events)
+		level.setBlock(pos, Block.stateById(b.state()), 18);
+		return true;
+	}
+
+	// Puts back the real blocks the replay changed. Chunks that were added by the
+	// replay are dropped anyway, so only the real chunks are touched.
+	private static void restoreBlocks(ClientLevel level) {
+		deferredBlocks.clear();
+		if (blockOriginals.isEmpty()) return;
+		Set<Long> added = new HashSet<>(addedChunks);
+		for (Map.Entry<Long, BlockState> e : blockOriginals.entrySet()) {
+			BlockPos pos = BlockPos.of(e.getKey());
+			int cx = pos.getX() >> 4;
+			int cz = pos.getZ() >> 4;
+			if (added.contains(chunkKey(cx, cz))) continue;
+			if (!isChunkLoaded(level, cx, cz)) continue;
+			level.setBlock(pos, e.getValue(), 18);
+		}
+		blockOriginals.clear();
+	}
+
+	// ---------------------------------------------------------------
 	// Terrain saving (step 1: only saves, the replay doesn't use it yet)
 	// ---------------------------------------------------------------
 
@@ -510,6 +611,9 @@ public class ExampleModClient implements ClientModInitializer {
 	// client's chunk area big enough for them (the game ignores chunks that are
 	// outside its chunk area)
 	private static void startTerrain(ClientLevel level, LocalPlayer p) {
+		blockEventPtr = 0;
+		deferredBlocks.clear();
+		blockOriginals.clear();
 		terrainPending.clear();
 		addedChunks.clear();
 		lightRefresh.clear();
@@ -1339,7 +1443,7 @@ public class ExampleModClient implements ClientModInitializer {
 						List<Frame> copy = new ArrayList<>(shadow);
 						try {
 							// Shadow Rewind doesn't save terrain yet
-							save(name, copy, new LinkedHashMap<>());
+							save(name, copy, new LinkedHashMap<>(), new ArrayList<>());
 							ctx.getSource().sendFeedback(Component.literal(
 								"Shadow saved: " + name + " (" + (copy.size() / 20) + " seconds)"));
 						} catch (IOException e) {
@@ -1382,7 +1486,8 @@ public class ExampleModClient implements ClientModInitializer {
 		return d;
 	}
 
-	private static void save(String name, List<Frame> data, Map<Long, TerrainChunk> terr) throws IOException {
+	private static void save(String name, List<Frame> data, Map<Long, TerrainChunk> terr,
+			List<BlockChange> changes) throws IOException {
 		try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(
 				new GZIPOutputStream(Files.newOutputStream(dir().resolve(name + ".rw")))))) {
 			out.writeInt(MAGIC);
@@ -1441,13 +1546,24 @@ public class ExampleModClient implements ClientModInitializer {
 					out.writeInt(v);
 				}
 			}
+
+			// Block changes
+			out.writeInt(changes.size());
+			for (BlockChange b : changes) {
+				out.writeInt(b.tick());
+				out.writeInt(b.x());
+				out.writeInt(b.y());
+				out.writeInt(b.z());
+				out.writeInt(b.state());
+			}
 		}
 	}
 
 	private static void load(String name) throws IOException {
 		try (DataInputStream in = new DataInputStream(new BufferedInputStream(
 				new GZIPInputStream(Files.newInputStream(dir().resolve(name + ".rw")))))) {
-			if (in.readInt() != MAGIC) {
+			int magic = in.readInt();
+			if (magic != MAGIC && magic != MAGIC_V8) {
 				throw new IOException("This is an old file format, please record a new one");
 			}
 			int n = in.readInt();
@@ -1533,8 +1649,26 @@ public class ExampleModClient implements ClientModInitializer {
 				loadedMap.put(chunkKey(cx, cz), new TerrainChunk(cx, cz, yStart, layers, rle));
 			}
 
+			// Block changes (files of the older format have none)
+			List<BlockChange> changes = new ArrayList<>();
+			if (magic == MAGIC) {
+				int changeCount = in.readInt();
+				if (changeCount < 0 || changeCount > MAX_BLOCK_EVENTS) {
+					throw new IOException("Corrupt replay file");
+				}
+				for (int i = 0; i < changeCount; i++) {
+					int tick = in.readInt();
+					int bx = in.readInt();
+					int by = in.readInt();
+					int bz = in.readInt();
+					int state = in.readInt();
+					changes.add(new BlockChange(tick, bx, by, bz, state));
+				}
+			}
+
 			frames = loaded;
 			loadedTerrain = loadedMap;
+			loadedBlockEvents = changes;
 		} catch (ZipException ex) {
 			throw new IOException("This is an old file format, please record a new one");
 		}
