@@ -104,8 +104,8 @@ public class ExampleModClient implements ClientModInitializer {
 	private record TerrainChunk(int cx, int cz, int yStart, int layers, int[] rle) {}
 
 	// One block change: it happens at the start of tick "tick", the block at x,y,z
-	// becomes block state "state" (a block state id, 0 = air)
-	private record BlockChange(int tick, int x, int y, int z, int state) {}
+	// goes from block state "oldState" to "state" (block state ids, 0 = air)
+	private record BlockChange(int tick, int x, int y, int z, int state, int oldState) {}
 
 	private static final int MAX_BLOCK_EVENTS = 200000;
 	private static List<BlockChange> blockEvents = new ArrayList<>(); // while recording
@@ -116,6 +116,9 @@ public class ExampleModClient implements ClientModInitializer {
 	private static final List<BlockChange> deferredBlocks = new ArrayList<>();
 	// What the replay changed in the real world: block position -> block before the change
 	private static final Map<Long, BlockState> blockOriginals = new HashMap<>();
+	// How the blocks looked when the recording started: chunk key -> list of {block position, state id}.
+	// Only blocks that change during the recording are in here.
+	private static final Map<Long, List<long[]>> initialBlocks = new HashMap<>();
 
 	private static List<Frame> frames = new ArrayList<>();
 	private static boolean recording = false;
@@ -205,7 +208,7 @@ public class ExampleModClient implements ClientModInitializer {
 	}
 
 	// Used by the block mixin: the client world just changed a block
-	public static void onBlockChanged(BlockPos pos, BlockState newState) {
+	public static void onBlockChanged(BlockPos pos, BlockState oldState, BlockState newState) {
 		if (!recording || playing) return;
 		if (blockEvents.size() >= MAX_BLOCK_EVENTS) {
 			if (!blockLimitWarned) {
@@ -216,7 +219,7 @@ public class ExampleModClient implements ClientModInitializer {
 			return;
 		}
 		blockEvents.add(new BlockChange(frames.size(), pos.getX(), pos.getY(), pos.getZ(),
-			Block.getId(newState)));
+			Block.getId(newState), Block.getId(oldState)));
 	}
 
 	// Used by the name screen
@@ -273,6 +276,7 @@ public class ExampleModClient implements ClientModInitializer {
 				lightRefresh.clear();
 				deferredBlocks.clear();
 				blockOriginals.clear();
+				initialBlocks.clear();
 				handSaved = false;
 				savedHand = ItemStack.EMPTY;
 				return;
@@ -492,21 +496,61 @@ public class ExampleModClient implements ClientModInitializer {
 	private static boolean setReplayBlock(ClientLevel level, BlockChange b) {
 		if (!isChunkLoaded(level, b.x() >> 4, b.z() >> 4)) return false;
 		if (level.isOutsideBuildHeight(b.y())) return true;
-		BlockPos pos = new BlockPos(b.x(), b.y(), b.z());
+		forceBlock(level, new BlockPos(b.x(), b.y(), b.z()), b.state());
+		return true;
+	}
+
+	// Sets a block and remembers what was there before (only the first time), so the
+	// real world can be put back when the replay ends
+	private static void forceBlock(ClientLevel level, BlockPos pos, int stateId) {
 		long key = pos.asLong();
 		if (!blockOriginals.containsKey(key)) {
 			blockOriginals.put(key, level.getBlockState(pos));
 		}
 		// 18 = tell the renderer, but don't update the neighbours (the recording
 		// already has their changes as separate events)
-		level.setBlock(pos, Block.stateById(b.state()), 18);
-		return true;
+		level.setBlock(pos, Block.stateById(stateId), 18);
+	}
+
+	// At replay start: the blocks that change during the recording get the state they
+	// had when the recording started (a broken block is back, a placed block is gone).
+	// Chunks that aren't there yet get this when they are added.
+	private static int applyInitialBlocks(ClientLevel level, int cx, int cz) {
+		List<long[]> list = initialBlocks.remove(chunkKey(cx, cz));
+		if (list == null) return 0;
+		for (long[] e : list) {
+			BlockPos pos = BlockPos.of(e[0]);
+			if (level.isOutsideBuildHeight(pos.getY())) continue;
+			forceBlock(level, pos, (int) e[1]);
+		}
+		return list.size();
+	}
+
+	private static int prepareInitialBlocks(ClientLevel level) {
+		initialBlocks.clear();
+		Set<Long> seen = new HashSet<>();
+		for (BlockChange b : loadedBlockEvents) {
+			long pos = new BlockPos(b.x(), b.y(), b.z()).asLong();
+			if (!seen.add(pos)) continue; // only the first change of a block counts
+			initialBlocks.computeIfAbsent(chunkKey(b.x() >> 4, b.z() >> 4), k -> new ArrayList<>())
+				.add(new long[] {pos, b.oldState()});
+		}
+		int done = 0;
+		for (long key : new ArrayList<>(initialBlocks.keySet())) {
+			int cx = (int) (key >> 32);
+			int cz = (int) key;
+			if (isChunkLoaded(level, cx, cz)) {
+				done += applyInitialBlocks(level, cx, cz);
+			}
+		}
+		return done;
 	}
 
 	// Puts back the real blocks the replay changed. Chunks that were added by the
 	// replay are dropped anyway, so only the real chunks are touched.
 	private static void restoreBlocks(ClientLevel level) {
 		deferredBlocks.clear();
+		initialBlocks.clear();
 		if (blockOriginals.isEmpty()) return;
 		Set<Long> added = new HashSet<>(addedChunks);
 		for (Map.Entry<Long, BlockState> e : blockOriginals.entrySet()) {
@@ -614,6 +658,11 @@ public class ExampleModClient implements ClientModInitializer {
 		blockEventPtr = 0;
 		deferredBlocks.clear();
 		blockOriginals.clear();
+		int restored = prepareInitialBlocks(level);
+		if (!loadedBlockEvents.isEmpty()) {
+			say(p, "[debug] block changes in this replay: " + loadedBlockEvents.size()
+				+ ", blocks set to their start state: " + restored);
+		}
 		terrainPending.clear();
 		addedChunks.clear();
 		lightRefresh.clear();
@@ -707,6 +756,7 @@ public class ExampleModClient implements ClientModInitializer {
 			TerrainChunk t = terrainPending.remove(0);
 			if (isChunkLoaded(level, t.cx(), t.cz())) continue;
 			addTerrainChunk(level, t, minSection);
+			applyInitialBlocks(level, t.cx(), t.cz());
 		}
 
 		if (terrainPending.isEmpty()) {
@@ -1555,6 +1605,7 @@ public class ExampleModClient implements ClientModInitializer {
 				out.writeInt(b.y());
 				out.writeInt(b.z());
 				out.writeInt(b.state());
+				out.writeInt(b.oldState());
 			}
 		}
 	}
@@ -1662,7 +1713,8 @@ public class ExampleModClient implements ClientModInitializer {
 					int by = in.readInt();
 					int bz = in.readInt();
 					int state = in.readInt();
-					changes.add(new BlockChange(tick, bx, by, bz, state));
+					int oldState = in.readInt();
+					changes.add(new BlockChange(tick, bx, by, bz, state, oldState));
 				}
 			}
 
