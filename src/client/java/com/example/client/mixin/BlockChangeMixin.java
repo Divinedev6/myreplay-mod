@@ -19,6 +19,6 @@ public class BlockChangeMixin {
 		at = @At("HEAD"), require = 0)
 	private void rw$recordBlockChange(BlockPos pos, BlockState oldState, BlockState newState,
 			int flags, CallbackInfo ci) {
-		ExampleModClient.onBlockChanged(pos, newState);
+		ExampleModClient.onBlockChanged(pos, oldState, newState);
 	}
 }
