@@ -6,7 +6,8 @@
 		"ExampleClientMixin",
 		"EntityHideMixin",
 		"LivingAnimMixin",
-		"BlockChangeMixin"
+		"BlockChangeMixin",
+		"AttackIndicatorMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1
