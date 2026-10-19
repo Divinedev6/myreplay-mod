@@ -202,6 +202,12 @@ public class ExampleModClient implements ClientModInitializer {
 		return playing && !animBypass && e == Minecraft.getInstance().player;
 	}
 
+	// Used by the attack-indicator mixin: during replay the cooldown bar under the
+	// crosshair is hidden (the replay swings the arm itself, which made it flicker)
+	public static boolean hideCooldown(Player p) {
+		return playing && p == Minecraft.getInstance().player;
+	}
+
 	// Used by the crouch mixin: is the replayed player crouching right now
 	public static boolean replayCrouching() {
 		return replayCrouch;
