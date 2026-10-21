@@ -71,7 +71,8 @@ import java.util.zip.GZIPOutputStream;
 import java.util.zip.ZipException;
 
 public class ExampleModClient implements ClientModInitializer {
-	private static final int MAGIC = 0x52570009; // file format v9 (gzip + terrain + block changes)
+	private static final int MAGIC = 0x5257000A; // file format v10 (gzip + terrain + block changes + cracks)
+	private static final int MAGIC_V9 = 0x52570009; // older format (no crack animation), still readable
 	private static final int MAGIC_V8 = 0x52570008; // old format (no block changes), still readable
 
 	// All equipment slots (head, chest, legs, feet, offhand, body armor, saddle...)
@@ -119,6 +120,17 @@ public class ExampleModClient implements ClientModInitializer {
 	// How the blocks looked when the recording started: chunk key -> list of {block position, state id}.
 	// Only blocks that change during the recording are in here.
 	private static final Map<Long, List<long[]>> initialBlocks = new HashMap<>();
+
+	// Block breaking animation (the cracks): at tick "tick" the block at x,y,z has
+	// break progress "progress" (0 to 9, -1 = the cracks go away)
+	private record CrackEvent(int tick, int x, int y, int z, int progress) {}
+
+	private static List<CrackEvent> crackEvents = new ArrayList<>(); // while recording
+	private static List<CrackEvent> loadedCrackEvents = new ArrayList<>(); // while replaying
+	private static int crackEventPtr = 0;
+	private static long lastCrackPos = Long.MIN_VALUE; // crack shown right now in the replay
+	private static long lastRecordedCrackPos = Long.MIN_VALUE;
+	private static int lastRecordedCrackProgress = -2;
 
 	private static List<Frame> frames = new ArrayList<>();
 	private static boolean recording = false;
@@ -228,9 +240,22 @@ public class ExampleModClient implements ClientModInitializer {
 			Block.getId(newState), Block.getId(oldState)));
 	}
 
+	// Used by the block mixin: some entity's block-breaking progress changed
+	public static void onCrackProgress(int breakerId, BlockPos pos, int progress) {
+		if (!recording || playing) return;
+		LocalPlayer p = Minecraft.getInstance().player;
+		if (p == null || breakerId != p.getId()) return; // only our own breaking
+		long key = pos.asLong();
+		if (key == lastRecordedCrackPos && progress == lastRecordedCrackProgress) return;
+		lastRecordedCrackPos = key;
+		lastRecordedCrackProgress = progress;
+		if (crackEvents.size() >= MAX_BLOCK_EVENTS) return;
+		crackEvents.add(new CrackEvent(frames.size(), pos.getX(), pos.getY(), pos.getZ(), progress));
+	}
+
 	// Used by the name screen
 	public static void saveFrames(String name) throws IOException {
-		save(name, frames, terrain, blockEvents);
+		save(name, frames, terrain, blockEvents, crackEvents);
 
 		// Tell how much terrain was saved (so we can check the file size)
 		LocalPlayer p = Minecraft.getInstance().player;
@@ -249,6 +274,7 @@ public class ExampleModClient implements ClientModInitializer {
 		frames = new ArrayList<>();
 		terrain.clear();
 		blockEvents = new ArrayList<>();
+		crackEvents = new ArrayList<>();
 	}
 
 	@Override
@@ -309,6 +335,9 @@ public class ExampleModClient implements ClientModInitializer {
 					frames = new ArrayList<>();
 					terrain.clear();
 					blockEvents = new ArrayList<>();
+					crackEvents = new ArrayList<>();
+					lastRecordedCrackPos = Long.MIN_VALUE;
+					lastRecordedCrackProgress = -2;
 					blockLimitWarned = false;
 					recording = true;
 					say(p, "Recording started! Press G again to stop.");
@@ -366,6 +395,7 @@ public class ExampleModClient implements ClientModInitializer {
 				int idx = playIndex;
 				Frame f = frames.get(playIndex++);
 				applyBlockChanges(level, idx);
+				applyCracks(level, idx);
 
 				// Position of the previous replay frame. We don't use the player's
 				// current position here, because the game moves the player a little
@@ -502,8 +532,36 @@ public class ExampleModClient implements ClientModInitializer {
 	private static boolean setReplayBlock(ClientLevel level, BlockChange b) {
 		if (!isChunkLoaded(level, b.x() >> 4, b.z() >> 4)) return false;
 		if (level.isOutsideBuildHeight(b.y())) return true;
-		forceBlock(level, new BlockPos(b.x(), b.y(), b.z()), b.state());
+		BlockPos pos = new BlockPos(b.x(), b.y(), b.z());
+		BlockState before = level.getBlockState(pos);
+		forceBlock(level, pos, b.state());
+		// A block next to the player disappears: play the break sound and particles
+		LocalPlayer me = Minecraft.getInstance().player;
+		if (me != null && Block.stateById(b.state()).isAir() && !before.isAir()
+				&& before.getFluidState().isEmpty()
+				&& me.distanceToSqr(b.x() + 0.5, b.y() + 0.5, b.z() + 0.5) < 64.0) {
+			level.levelEvent(2001, pos, Block.getId(before));
+		}
 		return true;
+	}
+
+	// Plays the block breaking animation (the cracks) that are due at replay tick "idx"
+	private static void applyCracks(ClientLevel level, int idx) {
+		LocalPlayer me = Minecraft.getInstance().player;
+		if (me == null) return;
+		while (crackEventPtr < loadedCrackEvents.size()) {
+			CrackEvent c = loadedCrackEvents.get(crackEventPtr);
+			if (c.tick() > idx) break;
+			crackEventPtr++;
+			BlockPos pos = new BlockPos(c.x(), c.y(), c.z());
+			if (!isChunkLoaded(level, pos.getX() >> 4, pos.getZ() >> 4)) continue;
+			level.destroyBlockProgress(me.getId(), pos, c.progress());
+			if (c.progress() >= 0) {
+				lastCrackPos = pos.asLong();
+			} else if (lastCrackPos == pos.asLong()) {
+				lastCrackPos = Long.MIN_VALUE;
+			}
+		}
 	}
 
 	// Sets a block and remembers what was there before (only the first time), so the
@@ -557,6 +615,11 @@ public class ExampleModClient implements ClientModInitializer {
 	private static void restoreBlocks(ClientLevel level) {
 		deferredBlocks.clear();
 		initialBlocks.clear();
+		LocalPlayer me = Minecraft.getInstance().player;
+		if (lastCrackPos != Long.MIN_VALUE && me != null) {
+			level.destroyBlockProgress(me.getId(), BlockPos.of(lastCrackPos), -1);
+		}
+		lastCrackPos = Long.MIN_VALUE;
 		if (blockOriginals.isEmpty()) return;
 		Set<Long> added = new HashSet<>(addedChunks);
 		for (Map.Entry<Long, BlockState> e : blockOriginals.entrySet()) {
@@ -662,6 +725,8 @@ public class ExampleModClient implements ClientModInitializer {
 	// outside its chunk area)
 	private static void startTerrain(ClientLevel level, LocalPlayer p) {
 		blockEventPtr = 0;
+		crackEventPtr = 0;
+		lastCrackPos = Long.MIN_VALUE;
 		deferredBlocks.clear();
 		blockOriginals.clear();
 		int restored = prepareInitialBlocks(level);
@@ -1499,7 +1564,7 @@ public class ExampleModClient implements ClientModInitializer {
 						List<Frame> copy = new ArrayList<>(shadow);
 						try {
 							// Shadow Rewind doesn't save terrain yet
-							save(name, copy, new LinkedHashMap<>(), new ArrayList<>());
+							save(name, copy, new LinkedHashMap<>(), new ArrayList<>(), new ArrayList<>());
 							ctx.getSource().sendFeedback(Component.literal(
 								"Shadow saved: " + name + " (" + (copy.size() / 20) + " seconds)"));
 						} catch (IOException e) {
@@ -1543,7 +1608,7 @@ public class ExampleModClient implements ClientModInitializer {
 	}
 
 	private static void save(String name, List<Frame> data, Map<Long, TerrainChunk> terr,
-			List<BlockChange> changes) throws IOException {
+			List<BlockChange> changes, List<CrackEvent> cracks) throws IOException {
 		try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(
 				new GZIPOutputStream(Files.newOutputStream(dir().resolve(name + ".rw")))))) {
 			out.writeInt(MAGIC);
@@ -1613,6 +1678,16 @@ public class ExampleModClient implements ClientModInitializer {
 				out.writeInt(b.state());
 				out.writeInt(b.oldState());
 			}
+
+			// Block breaking animation
+			out.writeInt(cracks.size());
+			for (CrackEvent c : cracks) {
+				out.writeInt(c.tick());
+				out.writeInt(c.x());
+				out.writeInt(c.y());
+				out.writeInt(c.z());
+				out.writeInt(c.progress());
+			}
 		}
 	}
 
@@ -1620,7 +1695,7 @@ public class ExampleModClient implements ClientModInitializer {
 		try (DataInputStream in = new DataInputStream(new BufferedInputStream(
 				new GZIPInputStream(Files.newInputStream(dir().resolve(name + ".rw")))))) {
 			int magic = in.readInt();
-			if (magic != MAGIC && magic != MAGIC_V8) {
+			if (magic != MAGIC && magic != MAGIC_V9 && magic != MAGIC_V8) {
 				throw new IOException("This is an old file format, please record a new one");
 			}
 			int n = in.readInt();
@@ -1708,7 +1783,7 @@ public class ExampleModClient implements ClientModInitializer {
 
 			// Block changes (files of the older format have none)
 			List<BlockChange> changes = new ArrayList<>();
-			if (magic == MAGIC) {
+			if (magic == MAGIC || magic == MAGIC_V9) {
 				int changeCount = in.readInt();
 				if (changeCount < 0 || changeCount > MAX_BLOCK_EVENTS) {
 					throw new IOException("Corrupt replay file");
@@ -1724,9 +1799,27 @@ public class ExampleModClient implements ClientModInitializer {
 				}
 			}
 
+			// Block breaking animation (only in the newest format)
+			List<CrackEvent> cracks = new ArrayList<>();
+			if (magic == MAGIC) {
+				int crackCount = in.readInt();
+				if (crackCount < 0 || crackCount > MAX_BLOCK_EVENTS) {
+					throw new IOException("Corrupt replay file");
+				}
+				for (int i = 0; i < crackCount; i++) {
+					int tick = in.readInt();
+					int cx = in.readInt();
+					int cy = in.readInt();
+					int cz = in.readInt();
+					int progress = in.readInt();
+					cracks.add(new CrackEvent(tick, cx, cy, cz, progress));
+				}
+			}
+
 			frames = loaded;
 			loadedTerrain = loadedMap;
 			loadedBlockEvents = changes;
+			loadedCrackEvents = cracks;
 		} catch (ZipException ex) {
 			throw new IOException("This is an old file format, please record a new one");
 		}
