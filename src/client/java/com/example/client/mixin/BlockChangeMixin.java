@@ -21,4 +21,11 @@ public class BlockChangeMixin {
 			int flags, CallbackInfo ci) {
 		ExampleModClient.onBlockChanged(pos, oldState, newState);
 	}
+
+	// While recording, also tell the mod how far a block is broken (the crack animation)
+	@Inject(method = "destroyBlockProgress(ILnet/minecraft/core/BlockPos;I)V",
+		at = @At("HEAD"), require = 0)
+	private void rw$recordCrack(int breakerId, BlockPos pos, int progress, CallbackInfo ci) {
+		ExampleModClient.onCrackProgress(breakerId, pos, progress);
+	}
 }
