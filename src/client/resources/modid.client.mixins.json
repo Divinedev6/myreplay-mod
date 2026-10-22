@@ -7,7 +7,8 @@
 		"EntityHideMixin",
 		"LivingAnimMixin",
 		"BlockChangeMixin",
-		"AttackIndicatorMixin"
+		"AttackIndicatorMixin",
+		"SoundRecordMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1
