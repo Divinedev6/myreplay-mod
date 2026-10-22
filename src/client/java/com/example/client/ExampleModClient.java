@@ -43,6 +43,9 @@ import net.minecraft.world.entity.Pose;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.client.resources.sounds.SoundInstance;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
@@ -71,7 +74,8 @@ import java.util.zip.GZIPOutputStream;
 import java.util.zip.ZipException;
 
 public class ExampleModClient implements ClientModInitializer {
-	private static final int MAGIC = 0x5257000A; // file format v10 (gzip + terrain + block changes + cracks)
+	private static final int MAGIC = 0x5257000B; // file format v11 (gzip + terrain + block changes + cracks + sounds)
+	private static final int MAGIC_V10 = 0x5257000A; // older format (no sounds), still readable
 	private static final int MAGIC_V9 = 0x52570009; // older format (no crack animation), still readable
 	private static final int MAGIC_V8 = 0x52570008; // old format (no block changes), still readable
 
@@ -131,6 +135,23 @@ public class ExampleModClient implements ClientModInitializer {
 	private static long lastCrackPos = Long.MIN_VALUE; // crack shown right now in the replay
 	private static long lastRecordedCrackPos = Long.MIN_VALUE;
 	private static int lastRecordedCrackProgress = -2;
+
+	// One sound heard while recording: at tick "tick" the sound "name" (index in the name
+	// list) of sound source "source" played at x,y,z
+	private record SoundEv(int tick, int name, int source, float x, float y, float z,
+						   float vol, float pitch) {}
+
+	private static final int MAX_SOUND_EVENTS = 100000;
+	private static final double SOUND_RANGE = 48.0; // only sounds this close to the player are saved
+	private static final int SOUNDS_PER_TICK = 16; // at most this many sounds start in one replay tick
+	private static List<SoundEv> soundEvents = new ArrayList<>(); // while recording
+	private static List<String> soundNames = new ArrayList<>();
+	private static final Map<String, Integer> soundNameIndex = new HashMap<>();
+	private static List<SoundEv> loadedSounds = new ArrayList<>(); // while replaying
+	private static List<String> loadedSoundNames = new ArrayList<>();
+	private static final Map<Integer, SoundEvent> soundCache = new HashMap<>();
+	private static int soundPtr = 0;
+	private static boolean muteSounds = false; // set while the mod makes particles that also play a sound
 
 	private static List<Frame> frames = new ArrayList<>();
 	private static boolean recording = false;
@@ -253,16 +274,45 @@ public class ExampleModClient implements ClientModInitializer {
 		crackEvents.add(new CrackEvent(frames.size(), pos.getX(), pos.getY(), pos.getZ(), progress));
 	}
 
+	// Used by the sound mixin: the game is about to play a sound
+	public static void onSound(SoundInstance sound) {
+		if (!recording || playing) return;
+		if (sound.isRelative() || sound.isLooping()) return; // menu clicks, music, loops
+		SoundSource source = sound.getSource();
+		if (source == SoundSource.MUSIC || source == SoundSource.RECORDS || source == SoundSource.MASTER) return;
+		LocalPlayer p = Minecraft.getInstance().player;
+		if (p == null || soundEvents.size() >= MAX_SOUND_EVENTS) return;
+		double dx = sound.getX() - p.getX();
+		double dy = sound.getY() - p.getY();
+		double dz = sound.getZ() - p.getZ();
+		if (dx * dx + dy * dy + dz * dz > SOUND_RANGE * SOUND_RANGE) return;
+		String name = sound.getIdentifier().toString();
+		Integer index = soundNameIndex.get(name);
+		if (index == null) {
+			index = soundNames.size();
+			soundNames.add(name);
+			soundNameIndex.put(name, index);
+		}
+		soundEvents.add(new SoundEv(frames.size(), index, source.ordinal(),
+			(float) sound.getX(), (float) sound.getY(), (float) sound.getZ(),
+			sound.getVolume(), sound.getPitch()));
+	}
+
+	// Used by the sound mixin: true while a sound must be dropped (see muteSounds)
+	public static boolean shouldMuteSound() {
+		return muteSounds;
+	}
+
 	// Used by the name screen
 	public static void saveFrames(String name) throws IOException {
-		save(name, frames, terrain, blockEvents, crackEvents);
+		save(name, frames, terrain, blockEvents, crackEvents, soundNames, soundEvents);
 
 		// Tell how much terrain was saved (so we can check the file size)
 		LocalPlayer p = Minecraft.getInstance().player;
 		if (p != null) {
 			long kb = Files.size(dir().resolve(name + ".rw")) / 1024;
 			say(p, "Terrain: " + terrain.size() + " chunks saved, " + blockEvents.size()
-				+ " block changes, file size " + kb + " KB");
+				+ " block changes, " + soundEvents.size() + " sounds, file size " + kb + " KB");
 		}
 	}
 
@@ -275,6 +325,9 @@ public class ExampleModClient implements ClientModInitializer {
 		terrain.clear();
 		blockEvents = new ArrayList<>();
 		crackEvents = new ArrayList<>();
+		soundEvents = new ArrayList<>();
+		soundNames = new ArrayList<>();
+		soundNameIndex.clear();
 	}
 
 	@Override
@@ -336,6 +389,9 @@ public class ExampleModClient implements ClientModInitializer {
 					terrain.clear();
 					blockEvents = new ArrayList<>();
 					crackEvents = new ArrayList<>();
+					soundEvents = new ArrayList<>();
+					soundNames = new ArrayList<>();
+					soundNameIndex.clear();
 					lastRecordedCrackPos = Long.MIN_VALUE;
 					lastRecordedCrackProgress = -2;
 					blockLimitWarned = false;
@@ -396,6 +452,7 @@ public class ExampleModClient implements ClientModInitializer {
 				Frame f = frames.get(playIndex++);
 				applyBlockChanges(level, idx);
 				applyCracks(level, idx);
+				applySounds(level, idx);
 
 				// Position of the previous replay frame. We don't use the player's
 				// current position here, because the game moves the player a little
@@ -540,9 +597,38 @@ public class ExampleModClient implements ClientModInitializer {
 		if (me != null && Block.stateById(b.state()).isAir() && !before.isAir()
 				&& before.getFluidState().isEmpty()
 				&& me.distanceToSqr(b.x() + 0.5, b.y() + 0.5, b.z() + 0.5) < 64.0) {
-			level.levelEvent(2001, pos, Block.getId(before));
+			// If the recording has its own sounds, the break sound comes from there
+			muteSounds = !loadedSounds.isEmpty();
+			try {
+				level.levelEvent(2001, pos, Block.getId(before));
+			} finally {
+				muteSounds = false;
+			}
 		}
 		return true;
+	}
+
+	// Plays the sounds that are due at replay tick "idx"
+	private static void applySounds(ClientLevel level, int idx) {
+		SoundSource[] sources = SoundSource.values();
+		int played = 0;
+		while (soundPtr < loadedSounds.size()) {
+			SoundEv s = loadedSounds.get(soundPtr);
+			if (s.tick() > idx) break;
+			soundPtr++;
+			if (played >= SOUNDS_PER_TICK) continue; // too many at once: skip the rest
+			if (s.name() < 0 || s.name() >= loadedSoundNames.size()) continue;
+			SoundEvent event = soundCache.get(s.name());
+			if (event == null) {
+				Identifier id = Identifier.tryParse(loadedSoundNames.get(s.name()));
+				if (id == null) continue;
+				event = SoundEvent.createVariableRangeEvent(id);
+				soundCache.put(s.name(), event);
+			}
+			SoundSource source = sources[Mth.clamp(s.source(), 0, sources.length - 1)];
+			level.playLocalSound(s.x(), s.y(), s.z(), event, source, s.vol(), s.pitch(), false);
+			played++;
+		}
 	}
 
 	// Plays the block breaking animation (the cracks) that are due at replay tick "idx"
@@ -726,13 +812,15 @@ public class ExampleModClient implements ClientModInitializer {
 	private static void startTerrain(ClientLevel level, LocalPlayer p) {
 		blockEventPtr = 0;
 		crackEventPtr = 0;
+		soundPtr = 0;
 		lastCrackPos = Long.MIN_VALUE;
 		deferredBlocks.clear();
 		blockOriginals.clear();
 		int restored = prepareInitialBlocks(level);
-		if (!loadedBlockEvents.isEmpty()) {
+		if (!loadedBlockEvents.isEmpty() || !loadedSounds.isEmpty()) {
 			say(p, "[debug] block changes in this replay: " + loadedBlockEvents.size()
-				+ ", blocks set to their start state: " + restored);
+				+ ", blocks set to their start state: " + restored
+				+ ", sounds: " + loadedSounds.size());
 		}
 		terrainPending.clear();
 		addedChunks.clear();
@@ -1564,7 +1652,8 @@ public class ExampleModClient implements ClientModInitializer {
 						List<Frame> copy = new ArrayList<>(shadow);
 						try {
 							// Shadow Rewind doesn't save terrain yet
-							save(name, copy, new LinkedHashMap<>(), new ArrayList<>(), new ArrayList<>());
+							save(name, copy, new LinkedHashMap<>(), new ArrayList<>(), new ArrayList<>(),
+								new ArrayList<>(), new ArrayList<>());
 							ctx.getSource().sendFeedback(Component.literal(
 								"Shadow saved: " + name + " (" + (copy.size() / 20) + " seconds)"));
 						} catch (IOException e) {
@@ -1608,7 +1697,8 @@ public class ExampleModClient implements ClientModInitializer {
 	}
 
 	private static void save(String name, List<Frame> data, Map<Long, TerrainChunk> terr,
-			List<BlockChange> changes, List<CrackEvent> cracks) throws IOException {
+			List<BlockChange> changes, List<CrackEvent> cracks,
+			List<String> soundNameList, List<SoundEv> soundList) throws IOException {
 		try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(
 				new GZIPOutputStream(Files.newOutputStream(dir().resolve(name + ".rw")))))) {
 			out.writeInt(MAGIC);
@@ -1688,6 +1778,23 @@ public class ExampleModClient implements ClientModInitializer {
 				out.writeInt(c.z());
 				out.writeInt(c.progress());
 			}
+
+			// Sounds
+			out.writeInt(soundNameList.size());
+			for (String n : soundNameList) {
+				out.writeUTF(n);
+			}
+			out.writeInt(soundList.size());
+			for (SoundEv e : soundList) {
+				out.writeInt(e.tick());
+				out.writeInt(e.name());
+				out.writeInt(e.source());
+				out.writeFloat(e.x());
+				out.writeFloat(e.y());
+				out.writeFloat(e.z());
+				out.writeFloat(e.vol());
+				out.writeFloat(e.pitch());
+			}
 		}
 	}
 
@@ -1695,7 +1802,7 @@ public class ExampleModClient implements ClientModInitializer {
 		try (DataInputStream in = new DataInputStream(new BufferedInputStream(
 				new GZIPInputStream(Files.newInputStream(dir().resolve(name + ".rw")))))) {
 			int magic = in.readInt();
-			if (magic != MAGIC && magic != MAGIC_V9 && magic != MAGIC_V8) {
+			if (magic != MAGIC && magic != MAGIC_V10 && magic != MAGIC_V9 && magic != MAGIC_V8) {
 				throw new IOException("This is an old file format, please record a new one");
 			}
 			int n = in.readInt();
@@ -1799,9 +1906,9 @@ public class ExampleModClient implements ClientModInitializer {
 				}
 			}
 
-			// Block breaking animation (only in the newest format)
+			// Block breaking animation (format v10 and newer)
 			List<CrackEvent> cracks = new ArrayList<>();
-			if (magic == MAGIC) {
+			if (magic == MAGIC || magic == MAGIC_V10) {
 				int crackCount = in.readInt();
 				if (crackCount < 0 || crackCount > MAX_BLOCK_EVENTS) {
 					throw new IOException("Corrupt replay file");
@@ -1816,10 +1923,41 @@ public class ExampleModClient implements ClientModInitializer {
 				}
 			}
 
+			// Sounds (only in the newest format)
+			List<String> soundNameList = new ArrayList<>();
+			List<SoundEv> soundList = new ArrayList<>();
+			if (magic == MAGIC) {
+				int nameCount = in.readInt();
+				if (nameCount < 0 || nameCount > 20000) {
+					throw new IOException("Corrupt replay file");
+				}
+				for (int i = 0; i < nameCount; i++) {
+					soundNameList.add(in.readUTF());
+				}
+				int soundCount = in.readInt();
+				if (soundCount < 0 || soundCount > MAX_SOUND_EVENTS) {
+					throw new IOException("Corrupt replay file");
+				}
+				for (int i = 0; i < soundCount; i++) {
+					int tick = in.readInt();
+					int nameIndex = in.readInt();
+					int source = in.readInt();
+					float sx = in.readFloat();
+					float sy = in.readFloat();
+					float sz = in.readFloat();
+					float vol = in.readFloat();
+					float pitch = in.readFloat();
+					soundList.add(new SoundEv(tick, nameIndex, source, sx, sy, sz, vol, pitch));
+				}
+			}
+
 			frames = loaded;
 			loadedTerrain = loadedMap;
 			loadedBlockEvents = changes;
 			loadedCrackEvents = cracks;
+			loadedSounds = soundList;
+			loadedSoundNames = soundNameList;
+			soundCache.clear();
 		} catch (ZipException ex) {
 			throw new IOException("This is an old file format, please record a new one");
 		}
